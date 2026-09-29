@@ -91,6 +91,7 @@ import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  hasCommittedItem,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
@@ -2970,6 +2971,16 @@ function ComposerImpl(
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
+    // The send may have proven delivered since the render that scheduled this
+    // effect: its committed item landed under the send's stable id (see
+    // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
+    if (
+      failedSendDraft.stableId !== undefined &&
+      hasCommittedItem(useChatStore.getState().blocks, failedSendDraft.stableId)
+    ) {
+      useChatStore.setState({ failedSendDraft: null });
+      return;
+    }
     useChatStore.setState({
       failedSendDraft: null,
       pendingRetryStableId: failedSendDraft.stableId ?? null,
@@ -2985,10 +2996,9 @@ function ComposerImpl(
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0)
       attachmentsRef.current.replaceFiles(failedSendDraft.files);
-    // Remember what was restored: if the "failed" send turns out to have been
-    // delivered (its stable id shows up as a committed item), the retraction
-    // effect below empties the composer instead of leaving an already-sent
-    // prompt primed for a duplicate send.
+    // Remember what was restored: if the "failed" send proves delivered (its
+    // stable id shows up as a committed item), the retraction effect below
+    // empties the composer instead of priming a duplicate send.
     if (failedSendDraft.stableId) {
       useChatStore.setState({
         restoredSendDraft: {
@@ -3004,13 +3014,9 @@ function ComposerImpl(
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
 
-  // Retract a restored failed-send draft once its send is proven delivered:
-  // the network cut the POST's acknowledgement, not the request
-  // (backgrounding, a VPN blip), and the message's committed item — persisted
-  // under the send's stable id — arrived over the stream or a reconnect
-  // snapshot. The prompt was sent and answered, so the composer must not keep
-  // it primed for a duplicate send. Edits win: the text is cleared only while
-  // it is exactly what the restore put there.
+  // Retract a restored failed-send draft once its send proves delivered (its
+  // committed item arrived over the stream or a reconnect snapshot). Edits win:
+  // the text is cleared only while it is exactly what the restore put there.
   useEffect(() => {
     if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
     if (restoredSendDraft.conversationId !== conversationId) return;
@@ -3019,7 +3025,9 @@ function ComposerImpl(
     const expected = serializeReplyDraft(
       restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
     );
-    const filesUnedited = filesRef.current.every((f) => restoredSendDraft.files.includes(f));
+    const filesUnedited =
+      filesRef.current.length === restoredSendDraft.files.length &&
+      filesRef.current.every((f) => restoredSendDraft.files.includes(f));
     if (valueRef.current !== expected || !filesUnedited) return;
     replaceText("");
     attachmentsRef.current.replaceFiles([]);

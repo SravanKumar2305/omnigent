@@ -5339,11 +5339,8 @@ describe("chatStore — send (file attachments)", () => {
 });
 
 describe("chatStore — delivered-but-unacked send", () => {
-  // A network failure on the send POST only proves the acknowledgement was
-  // lost (backgrounding / VPN blip): the message may still have reached the
-  // server, where it persists under the send's stable id. Its committed item
-  // arriving is proof of delivery — the failed-send draft must be retracted
-  // instead of repopulating the composer with an already-sent prompt.
+  // A network failure on the send POST only proves the acknowledgement was lost;
+  // the committed item arriving under the send's stable id proves delivery.
 
   it("retracts the failed-send draft when its message commits under the send's stable id", async () => {
     useChatStore.setState({

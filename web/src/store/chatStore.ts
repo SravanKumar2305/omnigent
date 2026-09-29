@@ -808,15 +808,10 @@ export interface ConversationState {
    */
   pendingRetryStableId: string | null;
   /**
-   * A failed-send draft the composer has restored, kept until the send's
-   * fate is known. A network failure only proves the POST's *response* was
-   * lost — the request may still have reached the server (backgrounding or
-   * a VPN blip cuts the network after the send goes out). The server
-   * persists a web send under its client `stable_id`, so a committed item
-   * with that id later arriving proves delivery: `delivered` flips true and
-   * the composer drops the restored text instead of priming a duplicate
-   * send (see ChatPage's retraction effect). User edits win over the
-   * retraction.
+   * A failed-send draft the composer has restored, kept until the send's fate
+   * is known: a committed item under its `stable_id` proves the POST reached
+   * the server, `delivered` flips true, and the composer drops the restored
+   * text (see ChatPage's retraction effect). User edits win over the retraction.
    */
   restoredSendDraft: {
     conversationId: string;
@@ -2376,12 +2371,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
       // A network failure can lose only the POST's response: if the message's
-      // committed item (persisted under this send's stable id) already came
-      // back over the stream, the send was delivered — restoring a draft
-      // would repopulate the composer with an already-sent prompt.
+      // committed item already came back over the stream, the send was delivered
+      // and restoring a draft would repopulate the composer with a sent prompt.
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
-      const deliveredDespiteFailure = draftState.blocks.some((b) => b.ctx.itemId === stableId);
+      const deliveredDespiteFailure = hasCommittedItem(draftState.blocks, stableId);
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -5999,21 +5993,17 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   return content;
 }
 
-function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
+export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
 }
 
 /**
  * Retract a failed-send draft once its message is proven delivered.
  *
- * A send whose POST failed client-side may still have reached the server —
- * the network was cut after the request went out (backgrounding, VPN blip),
- * so only the acknowledgement was lost. The server persists a web send under
- * its client `stable_id`, so a committed item with that id IS that send.
- * Clears an un-restored draft (nothing to hand back), flips a restored one
- * to `delivered` so the composer drops its text (ChatPage's retraction
- * effect), and stops the next send from reusing the stable id — the store
- * would dedupe the new message away as a replay of the delivered one.
+ * A committed item under the send's `stable_id` means the POST reached the
+ * server and only its acknowledgement was lost. Clears an un-restored draft,
+ * flips a restored one to `delivered` so the composer drops its text, and
+ * stops the next send from reusing the id (the store would dedupe it away).
  *
  * @param s - The conversation's state.
  * @param committedItemIds - Item ids just committed (live event or snapshot).

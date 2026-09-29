@@ -5879,7 +5879,10 @@ async def _forward_event_to_runner(
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
-    item = _build_new_item(body, turn_id, created_by=created_by)
+    # A web send keeps its client stable id so the persisted item is
+    # idempotent on retry and recognizable to the client (see
+    # _web_send_stable_id); seeded items keep store-assigned ids.
+    item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,

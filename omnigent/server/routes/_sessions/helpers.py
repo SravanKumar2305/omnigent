@@ -6994,6 +6994,8 @@ def _build_new_item(
     body: SessionEventInput,
     response_id: str,
     created_by: str | None = None,
+    *,
+    adopt_stable_id: bool = False,
 ) -> NewConversationItem:
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
@@ -7018,6 +7020,10 @@ def _build_new_item(
     :param created_by: Authenticated identity of the actor posting
         the event, recorded for per-message attribution. ``None`` in
         single-user mode.
+    :param adopt_stable_id: Persist a web user message under the
+        client-minted ``stable_id`` it carries (see
+        :func:`_web_send_stable_id`). Off by default so seeded and
+        replayed items keep store-assigned ids.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
     :raises OmnigentError: When ``body.data`` does not satisfy the
@@ -7030,27 +7036,35 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
-    # A web send carries a client-minted stable_id so the message persists
-    # under a client-known id: appends become idempotent on retry, and the
-    # client can recognize its own send coming back (e.g. a POST whose
-    # acknowledgement a network drop swallowed) instead of treating it as
-    # failed. Same shape-gated adoption as the native pending-input path.
-    raw_stable_id = body.data.get("stable_id")
-    stable_id = (
-        raw_stable_id
-        if body.type == "message"
-        and body.data.get("role") == "user"
-        and isinstance(raw_stable_id, str)
-        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
-        else None
-    )
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
         data=data,
         created_by=created_by,
-        stable_id=stable_id,
+        stable_id=_web_send_stable_id(body) if adopt_stable_id else None,
     )
+
+
+def _web_send_stable_id(body: SessionEventInput) -> str | None:
+    """
+    Return the client-minted stable id of a web user-message send, if usable.
+
+    Persisting the send under its 32-hex ``stable_id`` makes the append idempotent
+    on retry and lets the client recognize its own send coming back after a lost
+    acknowledgement. Same shape gate as the native pending-input path.
+
+    :param body: Validated event input.
+    :returns: The stable id for a user message carrying a well-formed one, else ``None``.
+    """
+    raw_stable_id = body.data.get("stable_id")
+    if (
+        body.type == "message"
+        and body.data.get("role") == "user"
+        and isinstance(raw_stable_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+    ):
+        return raw_stable_id
+    return None
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:

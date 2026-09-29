@@ -159,7 +159,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
   getGoal: vi.fn(),
 }));
-import type { ElicitationBlock } from "@/lib/blocks";
+import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
@@ -3383,6 +3383,8 @@ describe("Composer reply quotes", () => {
       skills: [],
       blocks: [],
       failedSendDraft: null,
+      restoredSendDraft: null,
+      pendingRetryStableId: null,
       queuedMessages: [],
     });
   });
@@ -3825,6 +3827,29 @@ describe("Composer reply quotes", () => {
     );
     expect(textarea()).toHaveValue("resend me, but edited");
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
+  });
+
+  it("drops a failed-send draft whose message already committed under its stable id", () => {
+    const stableId = "e".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const committed: UserMessageBlock = {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: stableId },
+      content: [{ type: "input_text", text: "resend me" }],
+    };
+    // Delivery proof landed before the restore ran: only the acknowledgement
+    // was lost, so the stale draft must be dropped rather than restored.
+    act(() =>
+      useChatStore.setState({
+        blocks: [committed],
+        failedSendDraft: { conversationId: "conv_test", text: "resend me", files: [], stableId },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
   it.each([false, true])(
