@@ -1261,6 +1261,303 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
     }
 
 
+_TEAMMATE_MESSAGE = (
+    '<teammate-message teammate_id="researcher" color="blue" summary="Research complete">\n'
+    "The findings are ready.\n"
+    "</teammate-message>"
+)
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    ("text", "origin"),
+    [
+        (_TEAMMATE_MESSAGE, None),
+        ('<agent-message from="researcher">Done.</agent-message>', None),
+        (_TEAMMATE_MESSAGE + "\n\n" + _TEAMMATE_MESSAGE, None),
+        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, None),
+        (
+            "Another Claude session sent a message while you were working:\n" + _TEAMMATE_MESSAGE,
+            None,
+        ),
+        ("A peer session sent a message while you were working:\n" + _TEAMMATE_MESSAGE, None),
+        (
+            "Another Claude session sent a message:\n"
+            + _TEAMMATE_MESSAGE
+            + "\n\nThis came from another Claude session — not typed by your user, "
+            "but very likely working on their behalf.",
+            None,
+        ),
+        ("The findings are ready.", {"kind": "peer", "from": "researcher"}),
+    ],
+)
+def test_read_transcript_items_marks_teammate_messages_meta(
+    tmp_path: Path, as_blocks: bool, text: str, origin: dict[str, str] | None
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "teammate-result",
+                "origin": origin,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}] if as_blocks else text,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript, 0, agent_name="claude-native-ui")
+
+    assert len(items) == 1
+    assert items[0].data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": text}],
+    }
+
+
+@pytest.mark.parametrize(
+    "human_text",
+    [
+        "Explain this message format: " + _TEAMMATE_MESSAGE,
+        _TEAMMATE_MESSAGE + "\nWhat does this mean?",
+        "Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE + "\nWhat does this mean?",
+        "```xml\n" + _TEAMMATE_MESSAGE + "\n```",
+    ],
+)
+def test_read_transcript_items_keeps_human_text_and_tool_results_with_teammate_blocks(
+    tmp_path: Path, human_text: str
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "mixed-content",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _TEAMMATE_MESSAGE},
+                        {"type": "text", "text": human_text},
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "done"},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(
+        transcript, 0, agent_name="claude-native-ui", current_response_id="resp_active"
+    )
+
+    visible = [item for item in items if not item.data.get("is_meta")]
+    assert [item.item_type for item in visible] == ["message", "function_call_output"]
+    assert visible[0].data["content"] == [{"type": "input_text", "text": human_text}]
+    assert visible[1].data == {"call_id": "tool-1", "output": "done"}
+    assert visible[1].response_id == "resp_active"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "metadata"),
+    [
+        ("The subagent finished.", {"isMeta": True}),
+        (_TEAMMATE_MESSAGE, {}),
+        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, {}),
+        ("The findings are ready.", {"origin": {"kind": "peer"}}),
+        ("<task-notification><task-id>task-1</task-id></task-notification>", {}),
+    ],
+)
+def test_read_transcript_items_skips_queued_agent_notifications(
+    tmp_path: Path, prompt: str, metadata: dict[str, Any]
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "attachment",
+                "uuid": "queued-notification",
+                "attachment": {
+                    "type": "queued_command",
+                    "commandMode": "prompt",
+                    "prompt": prompt,
+                    **metadata,
+                },
+            }
+        )
+        + _transcript_line(_assistant_text_entry("continued", "Here are the findings.")),
+        encoding="utf-8",
+    )
+
+    cursor, response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="claude-native-ui", current_response_id="resp_active"
+    )
+
+    assert cursor == 2
+    assert len(items) == 1
+    assert items[0].data["role"] == "assistant"
+    assert items[0].response_id == response_id == "resp_active"
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+def test_teammate_message_preserves_active_assistant_response(
+    tmp_path: Path, as_blocks: bool
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(_assistant_text_entry("before", "Still researching."))
+        + _transcript_line(
+            {
+                "type": "user",
+                "uuid": "teammate",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": _TEAMMATE_MESSAGE}]
+                    if as_blocks
+                    else _TEAMMATE_MESSAGE,
+                },
+            }
+        )
+        + _transcript_line(_assistant_text_entry("after", "More findings.")),
+        encoding="utf-8",
+    )
+    _, response_id, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
+    assert items[0].response_id == items[-1].response_id == response_id
+    assert items[1].data["is_meta"] is True
+
+
+@pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])
+@pytest.mark.parametrize("handback", [False, True])
+def test_native_completion_keeps_hidden_provenance(
+    tmp_path: Path, queued: str | None, handback: bool
+) -> None:
+    text = (
+        '<agent-message from="researcher">Done.</agent-message>'
+        if handback
+        else "<task-notification><task-id>agent-1</task-id>"
+        "<status>completed</status></task-notification>"
+    )
+    metadata: dict[str, Any] = {"isMeta": True}
+    if handback:
+        metadata["origin"] = {"kind": "peer", "handback": True, "senderTaskId": "agent-1"}
+    entry = (
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": queued,
+                "prompt": text,
+                **metadata,
+            },
+        }
+        if queued
+        else {"type": "user", "message": {"role": "user", "content": text}, **metadata}
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+    _, response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+    assert len(items) == 1
+    assert items[0].data["is_meta"] is True
+    assert items[0].subagent_return_id == ("agent-1" if handback else None)
+    if queued:
+        assert response_id == "active"
+
+
+@pytest.mark.parametrize("status", ["completed", "async_launched"])
+def test_native_agent_tool_result_carries_only_completion_provenance(
+    tmp_path: Path, status: str
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "tool-result",
+                "toolUseResult": {"agentId": "agent-1", "status": status},
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": "Result text",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
+    assert len(items) == 1
+    assert items[0].subagent_return_id == ("agent-1" if status == "completed" else None)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<task-notification><status>completed</status></task-notification>",
+        "<task-notification><task-id>agent-1</task-id><status>completed</status>",
+    ],
+)
+@pytest.mark.parametrize("as_blocks", [False, True])
+def test_partial_meta_completion_never_becomes_user_message(
+    tmp_path: Path, text: str, as_blocks: bool
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}] if as_blocks else text,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+    assert items == []
+    assert response_id == "active"
+
+
+def test_meta_completion_companion_text_stays_hidden(tmp_path: Path) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<task-notification><task-id>agent-1</task-id>"
+                            "<status>completed</status></task-notification>",
+                        },
+                        {"type": "text", "text": "Internal completion guidance."},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
+    assert len(items) == 2
+    assert all(item.data.get("is_meta") is True for item in items)
+
+
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
     """
     An ``isCompactSummary`` user record is flagged, not rendered as a bubble.

@@ -354,6 +354,10 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.subagent_activity import (
+    record_claude_subagent_return,
+    record_subagent_activity,
+)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -2432,6 +2436,9 @@ async def _persist_external_antigravity_subagent_start(
     )
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
     return await _create_and_publish_antigravity_child(
         parent_id,
@@ -2482,6 +2489,9 @@ async def _persist_external_codex_subagent_start(
     labels = _codex_subagent_labels_from_body(thread_id, body)
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
     return await _create_and_publish_codex_child(
         parent_id, parent_conv, thread_id, labels, conversation_store
@@ -2845,8 +2855,8 @@ async def _persist_external_conversation_item_unlocked(
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
-    _publish_persisted_external_item(
-        session_id, body, persisted, cleared_pending_id=cleared_pending_id
+    await _publish_persisted_external_item(
+        session_id, body, persisted, conversation_store, cleared_pending_id=cleared_pending_id
     )
     return persisted.id
 
@@ -2882,10 +2892,11 @@ def _new_external_conversation_item(
     return item
 
 
-def _publish_persisted_external_item(
+async def _publish_persisted_external_item(
     session_id: str,
     body: SessionEventInput,
     persisted: ConversationItem,
+    conversation_store: ConversationStore,
     cleared_pending_id: str | None = None,
 ) -> None:
     """Broadcast a newly persisted external item and drive any elicitation it resolves."""
@@ -2897,6 +2908,20 @@ def _publish_persisted_external_item(
         message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
+    if (
+        body.data.get("subagent_return_id")
+        or (isinstance(persisted.data, MessageData) and persisted.data.is_meta)
+        or (
+            isinstance(persisted.data, FunctionCallOutputData)
+            and "agentId:" in persisted.data.output
+        )
+    ):
+        await record_claude_subagent_return(
+            session_id,
+            persisted,
+            conversation_store,
+            subagent_return_id=body.data.get("subagent_return_id"),
+        )
 
 
 async def _persist_external_conversation_items(
@@ -2926,7 +2951,7 @@ async def _persist_external_conversation_items(
     )
     for body, persisted in zip(bodies[: len(items)], persisted_items, strict=True):
         if not persisted.deduplicated:
-            _publish_persisted_external_item(session_id, body, persisted)
+            await _publish_persisted_external_item(session_id, body, persisted, conversation_store)
     if error is not None:
         raise error
     return [persisted.id for persisted in persisted_items]
@@ -7406,6 +7431,8 @@ async def _relay_runner_stream_once(
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
+    pending_subagent_return_id: str | None = None
+    pending_subagent_return_status = "completed"
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
@@ -7486,6 +7513,20 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
+                    if evt_type == "session.created":
+                        child_id = event.get("child_session_id")
+                        if isinstance(child_id, str) and child_id:
+                            await _flush_relay_text(
+                                conversation_store,
+                                session_id,
+                                text_acc,
+                                current_response_id,
+                                current_model,
+                            )
+                            await record_subagent_activity(
+                                child_id, "delegated", conversation_store, parent_id=session_id
+                            )
+
                     # Stopped turn: drop its trailing response.* output (no
                     # forward, no persist) but keep text_acc — the pre-stop
                     # narration the user watched persists at the terminal flush.
@@ -7504,6 +7545,15 @@ async def _relay_runner_stream_once(
 
                     if evt_type == "session.status":
                         status = event.get("status", "")
+                        if status in {"idle", "failed"} and pending_subagent_return_id is not None:
+                            await record_subagent_activity(
+                                session_id,
+                                "returned",
+                                conversation_store,
+                                turn_id=pending_subagent_return_id,
+                                status=pending_subagent_return_status,
+                            )
+                            pending_subagent_return_id = None
                         if status:
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
@@ -7616,6 +7666,7 @@ async def _relay_runner_stream_once(
                     # events so persisted items share one id.
                     if evt_type == "response.in_progress":
                         _turn_start_s = time.monotonic()
+                        pending_subagent_return_id = None
                         resp_obj = event.get("response", {})
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
@@ -7763,6 +7814,11 @@ async def _relay_runner_stream_once(
                         # still persists the sentinel, not the denied text.
                         if _deny_reason is not None and text_acc:
                             _llm_response_denied_turns[session_id] = _deny_reason
+                        pending_subagent_return_id = current_response_id
+                        pending_subagent_return_status = {
+                            "response.failed": "failed",
+                            "response.cancelled": "cancelled",
+                        }.get(evt_type, "completed")
 
                     if evt_type == "response.failed":
                         # The runner could not hand this turn to a native

@@ -804,6 +804,8 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param subagent_return_id: Claude's native task id for an explicit
+        handback; transported separately from model-visible message content.
     """
 
     source_id: str
@@ -812,6 +814,7 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    subagent_return_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -7779,10 +7782,30 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("type") != "queued_command":
         return current_response_id, []
-    if attachment.get("commandMode") != "prompt":
-        return current_response_id, []
     prompt = attachment.get("prompt")
     if not isinstance(prompt, str) or not prompt:
+        return current_response_id, []
+    return_id = _subagent_handback_id(attachment.get("origin"))
+    if return_id is not None or _is_task_completion_text(prompt):
+        source_key = _transcript_source_key(entry, line_number, record_offset)
+        return current_response_id, [
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "message"),
+                item_type="message",
+                data={
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+                response_id=_response_id_from_source(source_key),
+                subagent_return_id=return_id,
+            )
+        ]
+    if attachment.get("commandMode") != "prompt":
+        return current_response_id, []
+    if attachment.get("isMeta") is True:
+        return current_response_id, []
+    if _is_agent_notification_text(prompt, origin=attachment.get("origin")):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     item = ClaudeTranscriptItem(
@@ -7859,6 +7882,20 @@ _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
     "</task-notification>",
+)
+_TEAMMATE_MESSAGE_RE = re.compile(
+    r'(?:<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>.*?</teammate-message>'
+    r'|<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>.*?</agent-message>)',
+    re.DOTALL,
+)
+_TEAMMATE_MESSAGE_PREFIXES = (
+    "Another Claude session sent a message:\n",
+    "Another Claude session sent a message while you were working:\n",
+    "A peer session sent a message while you were working:\n",
+)
+_TEAMMATE_DELIVERY_GUIDANCE = (
+    "This came from another Claude session — not typed by your user,",
+    'That "other Claude session" is an agent working inside this same session —',
 )
 
 # Substrings Claude Code writes to a ``/compact`` command's
@@ -8144,10 +8181,49 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
-def _is_task_notification_text(text: str) -> bool:
+def _is_agent_notification_text(text: str, *, origin: object = None) -> bool:
+    """Identify Claude task and teammate context that is not a human prompt."""
+    if isinstance(origin, dict) and origin.get("kind") == "peer":
+        return True
     stripped = text.lstrip()
-    return stripped.startswith("<task-notification>") and all(
+    if stripped.startswith("<task-notification>") and all(
         marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    ):
+        return True
+    wrapped = False
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].lstrip()
+            wrapped = True
+            break
+    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+        return False
+    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
+        stripped = stripped[match.end() :].lstrip()
+        if not stripped:
+            return True
+    # Wrapped peer messages can append Claude's own explanatory guidance.
+    return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+
+
+def _subagent_handback_id(origin: object) -> str | None:
+    """Read Claude's explicit returned-result provenance, excluding teammate chatter."""
+    if (
+        not isinstance(origin, dict)
+        or origin.get("kind") != "peer"
+        or origin.get("handback") is not True
+    ):
+        return None
+    task_id = origin.get("senderTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _is_task_completion_text(text: str) -> bool:
+    return (
+        text.lstrip().startswith("<task-notification>")
+        and _is_agent_notification_text(text)
+        and re.search(r"<status>\s*(?:completed|failed|cancelled|killed)\s*</status>", text)
+        is not None
     )
 
 
@@ -8302,12 +8378,17 @@ def _user_transcript_items_from_entry(
     :returns: Updated active response id and parsed user/tool-result
         items.
     """
-    # ``isMeta=true`` carries CLI scaffolding like
-    # ``<local-command-caveat>``; no user-visible content.
-    if entry.get("isMeta") is True:
-        return current_response_id, []
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
+    return_id = _subagent_handback_id(entry.get("origin"))
+    notification_text = content if isinstance(content, str) else _summary_text_from_blocks(content)
+    # Keep hidden completion provenance so the parent can link the returned child.
+    if (
+        entry.get("isMeta") is True
+        and return_id is None
+        and not _is_task_completion_text(notification_text)
+    ):
+        return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
 
@@ -8344,6 +8425,28 @@ def _user_transcript_items_from_entry(
     if isinstance(content, str):
         if not content:
             return current_response_id, []
+        if entry.get("isMeta") is True or _is_agent_notification_text(
+            content, origin=entry.get("origin")
+        ):
+            items.append(
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "message"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "is_meta": True,
+                        "content": [{"type": "input_text", "text": content}],
+                    },
+                    response_id=fallback_response_id,
+                    subagent_return_id=return_id,
+                )
+            )
+            return (
+                None
+                if content.lstrip().startswith("<task-notification>")
+                else current_response_id,
+                items,
+            )
         stripped = content.lstrip()
         # Skill invocations with args ship the tag order
         # ``<command-message>…<command-name>…<command-args>…`` — i.e.
@@ -8399,20 +8502,6 @@ def _user_transcript_items_from_entry(
         # of leaking as user bubbles.
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
-        if _is_task_notification_text(content):
-            items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "message"),
-                    item_type="message",
-                    data={
-                        "role": "user",
-                        "is_meta": True,
-                        "content": [{"type": "input_text", "text": content}],
-                    },
-                    response_id=fallback_response_id,
-                )
-            )
-            return None, items
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "message"),
@@ -8442,6 +8531,25 @@ def _user_transcript_items_from_entry(
             text = block.get("text")
             if not isinstance(text, str) or not text:
                 continue
+            if entry.get("isMeta") is True or _is_agent_notification_text(
+                text, origin=entry.get("origin")
+            ):
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "message"),
+                        item_type="message",
+                        data={
+                            "role": "user",
+                            "is_meta": True,
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                        response_id=fallback_response_id,
+                        subagent_return_id=return_id,
+                    )
+                )
+                item_index += 1
+                saw_user_text = saw_user_text or text.lstrip().startswith("<task-notification>")
+                continue
             # Defensively guard against slash-command markup or other
             # CLI-scaffolding markers ever arriving in list-form
             # content. Today these only ship in string content (the
@@ -8453,22 +8561,6 @@ def _user_transcript_items_from_entry(
             if "<command-name>" in stripped or any(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
-                continue
-            if _is_task_notification_text(text):
-                items.append(
-                    ClaudeTranscriptItem(
-                        source_id=_source_id(source_key, item_index, "message"),
-                        item_type="message",
-                        data={
-                            "role": "user",
-                            "is_meta": True,
-                            "content": [{"type": "input_text", "text": text}],
-                        },
-                        response_id=fallback_response_id,
-                    )
-                )
-                item_index += 1
-                saw_user_text = True
                 continue
             user_blocks.append(
                 {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}
@@ -8492,6 +8584,7 @@ def _user_transcript_items_from_entry(
                     "output": _tool_result_output(entry, block),
                 },
                 response_id=response_id,
+                subagent_return_id=_completed_subagent_tool_id(entry),
             )
         )
         item_index += 1
@@ -8855,6 +8948,15 @@ def _strip_inline_image_data(value: object) -> object:
             return {"type": "text", "text": _stripped_image_placeholder(source)}
         return {key: _strip_inline_image_data(val) for key, val in value.items()}
     return value
+
+
+def _completed_subagent_tool_id(entry: _JsonObject) -> str | None:
+    """Read a synchronous Agent result's native identity, excluding launch handles."""
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict) or result.get("status") != "completed":
+        return None
+    agent_id = result.get("agentId")
+    return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
 def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:

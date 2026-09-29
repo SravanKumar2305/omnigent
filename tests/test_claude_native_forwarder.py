@@ -56,6 +56,35 @@ from omnigent.harnesses.claude_native.forwarder import (
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 
+@pytest.mark.asyncio
+async def test_handback_provenance_is_transported_outside_message_content() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    item = ClaudeTranscriptItem(
+        source_id="native-handback",
+        item_type="message",
+        data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": "Done."}],
+        },
+        response_id="parent-turn",
+        subagent_return_id="native-agent-1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._post_external_conversation_item(client, session_id="parent", item=item)
+    assert captured[0]["data"]["subagent_return_id"] == "native-agent-1"
+    assert captured[0]["data"]["item_data"] == item.data
+    assert "subagent_return_id" not in captured[0]["data"]["item_data"]
+    assert forwarder._external_conversation_item_event(item) == captured[0]
+
+
 @pytest.fixture(autouse=True)
 def _allow_tmp_path_as_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """

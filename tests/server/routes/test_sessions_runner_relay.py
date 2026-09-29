@@ -268,6 +268,53 @@ class _ScriptedRunnerClient:
 
 
 @pytest.mark.asyncio
+async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(db_uri: str) -> None:
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id, title="researcher:Auth audit"
+    )
+    release = asyncio.Event()
+    release.set()
+    parent_events = [
+        {"type": "response.in_progress", "response": {"id": "parent-turn", "model": "test"}},
+        {"type": "response.output_text.delta", "delta": "I will ask a researcher."},
+        {"type": "session.created", "child_session_id": child.id},
+        {"type": "session.created", "child_session_id": child.id},
+    ]
+    await _relay_runner_stream_once(
+        parent.id,
+        _ScriptedRunnerClient(release, parent_events),
+        store,  # type: ignore[arg-type]
+    )
+    initial = store.list_items(parent.id).data
+    assert [item.type for item in initial] == ["message", "resource_event"]
+    assert initial[1].data.resource == {"title": "Auth audit"}
+
+    child_events = [
+        {"type": "response.in_progress", "response": {"id": "first", "model": "test"}},
+        {"type": "response.completed", "response": {"id": "first"}},
+        {"type": "response.in_progress", "response": {"id": "second", "model": "test"}},
+        {"type": "response.output_text.delta", "delta": "Finished the full task."},
+        {"type": "response.completed", "response": {"id": "second"}},
+        {"type": "session.status", "status": "idle"},
+        {"type": "session.status", "status": "idle"},
+    ]
+    await _relay_runner_stream_once(
+        child.id,
+        _ScriptedRunnerClient(release, child_events),
+        store,  # type: ignore[arg-type]
+    )
+    items = store.list_items(parent.id, type="resource_event").data
+    assert [item.data.event_type for item in items] == [
+        "session.subagent.delegated",
+        "session.subagent.returned",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
     The relay's text flush publishes the persisted message to live clients.

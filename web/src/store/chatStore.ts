@@ -145,7 +145,11 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
+import {
+  isClaudeAgentMessageContent,
+  isSystemUserContent,
+  taskNotificationMarkerContent,
+} from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
@@ -6731,6 +6735,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
+      if (isClaudeAgentMessageContent(userContentFromEvent(event) ?? [])) return;
       // Promote the matching optimistic bubble into committed history.
       // Three ways to find it, in order of precision:
       //   1. By id — the server tells us which pending-input entry this

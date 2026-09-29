@@ -743,6 +743,37 @@ def test_list_recent_codex_sessions_excludes_non_interactive_sources(
     )
 
 
+def test_load_claude_session_preserves_hidden_teammate_context(tmp_path: Path) -> None:
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    teammate_text = '<teammate-message teammate_id="researcher">Done.</teammate-message>'
+    transcript.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": str(index),
+                    "message": {"role": "user", "content": text},
+                }
+            )
+            + "\n"
+            for index, text in enumerate((teammate_text, "Review the findings"))
+        ),
+        encoding="utf-8",
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.title == "Review the findings"
+    assert imported.items[0].data.model_dump(exclude_none=True) == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": teammate_text}],
+    }
+    assert "is_meta" not in imported.items[1].data.model_dump()
+
+
 def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

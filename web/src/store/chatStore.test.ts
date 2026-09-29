@@ -7449,6 +7449,53 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it.each([
+      '<teammate-message teammate_id="reviewer">Review complete</teammate-message>',
+      '<agent-message from="reviewer">Review complete</agent-message>',
+      'Another Claude session sent a message:\n<teammate-message teammate_id="reviewer">Review complete</teammate-message>',
+      "<task-notification><task-id>task-1</task-id><summary>Agent reviewer finished</summary></task-notification>",
+      "<task-notification><task-id>agent-1</task-id><result>Final report</result></task-notification>",
+    ])(
+      "ignores unmarked native agent context without stealing a queued user message: %s",
+      (text) => {
+        const pending: ConversationState["pendingUserMessages"] = [
+          { tempId: "pending_user", content: [{ type: "input_text", text: "Keep reviewing" }] },
+        ];
+        useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "msg_agent_context",
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text }] },
+        });
+
+        expect(useChatStore.getState().blocks).toEqual([]);
+        expect(useChatStore.getState().pendingUserMessages).toBe(pending);
+      },
+    );
+
+    it("renders a user asking about a teammate message in the live transcript", () => {
+      const content = [
+        {
+          type: "input_text" as const,
+          text: 'What is <teammate-message teammate_id="reviewer">Ready</teammate-message>?',
+        },
+      ];
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_user_question",
+        itemType: "message",
+        data: { role: "user", content },
+      });
+
+      expect(useChatStore.getState().blocks).toEqual([
+        expect.objectContaining({ type: "user_message", content }),
+      ]);
+    });
+
     it("is a no-op for non-message item types (e.g. function_call_output from other client)", () => {
       const existingBlocks: AnyBlock[] = [];
       useChatStore.setState({ blocks: existingBlocks, pendingUserMessages: [] });

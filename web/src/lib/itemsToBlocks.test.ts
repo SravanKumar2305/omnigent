@@ -105,7 +105,7 @@ describe("itemsToBlocks — flat shape", () => {
     ]);
   });
 
-  it("re-labels a Claude task notification as a system marker between real messages", () => {
+  it("hides a Claude subagent task notification between real messages", () => {
     const items: ConversationItem[] = [
       userMessage("resp_before", "visible before", "msg_before"),
       userMessage(
@@ -129,14 +129,7 @@ describe("itemsToBlocks — flat shape", () => {
 
     const userBlocks = blocks.filter((b): b is UserMessageBlock => b.type === "user_message");
     const texts = userBlocks.map((b) => b.content.map((c) => ("text" in c ? c.text : "")).join(""));
-    // The wake keeps its place as a `[System: …]` marker: it is a turn
-    // boundary, so the answer before it cannot fold into the work after it.
-    expect(texts).toEqual([
-      "visible before",
-      '[System: background task a815d170defd74675 completed]\nAgent "Explore spec" finished',
-      "visible after",
-    ]);
-    expect(userBlocks[1]!.ctx.itemId).toBe("msg_legacy_task_notification");
+    expect(texts).toEqual(["visible before", "visible after"]);
   });
 
   it("re-labels an is_meta task notification (bridge-marked) as a system marker", () => {
@@ -200,6 +193,25 @@ describe("itemsToBlocks — flat shape", () => {
           "[System: background task b1mhekpmy finished]\n" +
           'Monitor event: "PR 2086 E2E UI + npm test CI results"',
       },
+    ]);
+  });
+
+  it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
+    const envelope =
+      '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';
+    const blocks = itemsToBlocks([
+      userMessage("resp_1", "Review this change", "msg_before"),
+      userMessage("resp_2", envelope, "msg_teammate"),
+      userMessage("resp_2", '<agent-message from="reviewer">Ready</agent-message>', "msg_report"),
+      userMessage("resp_3", `Another Claude session sent a message:\n${envelope}`, "msg_peer"),
+      assistantMessage("resp_3", "The review is complete."),
+      userMessage("resp_4", `What does ${envelope} mean?`, "msg_after"),
+    ]);
+
+    expect(blocks.map((block) => block.ctx.itemId)).toEqual([
+      "msg_before",
+      "msg_asst",
+      "msg_after",
     ]);
   });
 

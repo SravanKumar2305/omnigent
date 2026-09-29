@@ -329,3 +329,39 @@ async def test_external_session_status_still_forwards_to_runner(
     assert body["type"] == "external_session_status"
     assert body["data"] == data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+@pytest.mark.parametrize(
+    ("harness", "confirmation", "expected"),
+    [
+        ("claude-native", {}, None),
+        ("claude-native", {"turn_completed": True}, "completed"),
+        ("cursor-native", {"turn_outcome": "cancelled"}, "cancelled"),
+        ("cursor-native", {"turn_outcome": "failed"}, "failed"),
+        ("codex-native", {}, "completed"),
+    ],
+)
+async def test_external_child_activity_uses_confirmed_outcome(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    confirmation: dict[str, Any],
+    expected: str | None,
+) -> None:
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: harness)
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "idle", "response_id": "child-turn", **confirmation},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = route.store.list_items(route.parent_id).data
+    if expected is None:
+        assert items == []
+    else:
+        assert len(items) == 1
+        assert items[0].data.event_type == "session.subagent.returned"
+        assert items[0].data.resource["status"] == expected

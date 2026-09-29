@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -237,6 +238,58 @@ describe("BubbleView dispatch", () => {
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
+  });
+
+  const subagentActivity = (phase: "delegated" | "returned"): Bubble => ({
+    kind: "subagent_activity",
+    itemId: `activity_${phase}`,
+    data: {
+      type: "resource_event",
+      event_type: `session.subagent.${phase}`,
+      resource_type: "session",
+      resource_id: "conv_child",
+      resource: { title: "Review the change" },
+    },
+  });
+
+  it.each(["delegated", "returned"] as const)(
+    "spans the chat column for a %s notice without message chrome",
+    (phase) => {
+      render(
+        <MemoryRouter>
+          <BubbleView bubble={subagentActivity(phase)} />
+        </MemoryRouter>,
+      );
+
+      expect(screen.getByTestId("subagent-activity")).toHaveClass("w-full");
+      expect(screen.queryByTestId("message-bubble")).not.toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "Review the change" })).toHaveAttribute(
+        "href",
+        "/c/conv_child?panel=agents",
+      );
+      expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps assistant text actions beside a standalone lifecycle notice", () => {
+    const answer = assistantText("The review is complete.");
+    render(
+      <MemoryRouter>
+        <BubbleView bubble={subagentActivity("returned")} />
+        <BubbleView
+          bubble={{
+            ...answer,
+            createdAtS: 1_750_000_000,
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getAllByTestId("message-bubble")).toHaveLength(1);
+    expect(screen.getByText("The review is complete.")).toBeVisible();
+    expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 
   const errorItem = (): AssistantBubble["items"][number] => ({

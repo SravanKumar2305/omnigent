@@ -96,6 +96,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
+  isMobileViewport: () => !window.matchMedia("(min-width: 768px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -353,6 +354,27 @@ function NavProbe() {
       </button>
       <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
         to-home
+      </button>
+      <button
+        type="button"
+        data-testid="nav-agents-panel"
+        onClick={() => navigate("?panel=agents")}
+      >
+        reveal-agents
+      </button>
+      <button
+        type="button"
+        data-testid="nav-current-session"
+        onClick={() => navigate({ search: "" })}
+      >
+        current-agent-chat
+      </button>
+      <button
+        type="button"
+        data-testid="nav-unrelated-query"
+        onClick={() => navigate("?panel=agents&unrelated=1")}
+      >
+        unrelated-query
       </button>
     </div>
   );
@@ -3038,6 +3060,91 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Changes/i })).toBeNull();
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("reveals Agents from a sub-agent link even when the child's workspace was closed on a file", () => {
+    sessionStorage.setItem("omnigent.web.panel-key:conv_linked_child", "terminal_main");
+    writeSessionWorkspaceState("conv_linked_child", {
+      open: false,
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_linked_child", permission_level: null }]);
+
+    renderShell("/c/conv_linked_child?panel=agents");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+  });
+
+  describe("same-session Agents query navigation", () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it("closes the mobile drawer when selecting the current child and reopens from its link", () => {
+      mockConversations([{ id: "conv_child", permission_level: null }]);
+      renderShell("/c/conv_child?panel=agents");
+
+      expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "open");
+      fireEvent.click(screen.getByTestId("nav-current-session"));
+      expect(screen.getByTestId("url-params")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "closed");
+
+      fireEvent.click(screen.getByTestId("nav-agents-panel"));
+      expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "open");
+    });
+
+    it("keeps native child chat visible after closing Agents and allows a later Terminal toggle", () => {
+      localStorage.setItem("omnigent:default-transcript-view", "terminal");
+      sessionStorage.setItem("omnigent.web.panel-key:conv_child", "terminal:terminal_child");
+      mockConversations([
+        { id: "conv_child", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      ]);
+      useTerminalsMock.mockReturnValue({
+        terminals: [{ id: "terminal_child", name: "claude", session: "main", running: true }],
+        isLoading: false,
+        error: null,
+      });
+      renderShell("/c/conv_child?panel=agents");
+
+      expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+      fireEvent.click(screen.getByTestId("nav-current-session"));
+      expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "closed");
+      expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+
+      fireEvent.click(screen.getByTestId("nav-agents-panel"));
+      fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+      expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    });
+
+    it("preserves the desktop workspace on unrelated query changes and panel removal", () => {
+      const matchMedia = window.matchMedia;
+      vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query === "(min-width: 768px)",
+      }));
+      mockConversations([{ id: "conv_child", permission_level: null }]);
+      renderShell("/c/conv_child?panel=agents");
+      fireEvent.mouseDown(screen.getByRole("tab", { name: /Files/i }));
+
+      fireEvent.click(screen.getByTestId("nav-unrelated-query"));
+      expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
+      fireEvent.click(screen.getByTestId("nav-current-session"));
+      expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "closed");
+
+      fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+      fireEvent.click(screen.getByTestId("nav-agents-panel"));
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    });
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {

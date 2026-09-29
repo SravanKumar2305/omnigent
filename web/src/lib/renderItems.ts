@@ -22,6 +22,7 @@ import type {
   AnyBlock,
   ErrorBlock,
   MessageContentBlock,
+  NativeToolBlock,
   RoutingDecisionBlock,
   ToolExecution,
   ToolResultBlock,
@@ -218,6 +219,7 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
+  | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
       itemId: string;
@@ -323,7 +325,7 @@ function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
     ) {
       return null;
     }
-    if (isNonRenderingBlock(b) || b.type === "tool_result") continue;
+    if (isNonRenderingBlock(b) || b.type === "tool_result" || isSubagentActivityBlock(b)) continue;
     if (isAnonymousRid(b.ctx.responseId)) continue;
     return b.ctx.responseId;
   }
@@ -822,6 +824,18 @@ function walkBubbles(
       continue;
     }
 
+    if (isSubagentActivityBlock(b)) {
+      lastBubbleStart = i;
+      lastBubbleCount = 1;
+      bubbles.push({
+        kind: "subagent_activity",
+        itemId: b.ctx.itemId ?? `subagent_activity_${i}`,
+        data: b.data,
+      });
+      i += 1;
+      continue;
+    }
+
     if (b.type === "user_message") {
       // A native harness can accept a steering message without ending the
       // response already in progress. In persisted history that user message
@@ -979,7 +993,8 @@ function walkBubbles(
         cur.type === "user_message" ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
-        cur.type === "routing_decision"
+        cur.type === "routing_decision" ||
+        isSubagentActivityBlock(cur)
       )
         break;
       if (isNonRenderingBlock(cur)) {
@@ -1392,9 +1407,16 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
   return undefined;
 }
 
+function isSubagentActivityBlock(
+  b: AnyBlock,
+): b is NativeToolBlock & { toolType: "subagent_activity" } {
+  return b.type === "native_tool" && b.toolType === "subagent_activity";
+}
+
 /** Filter to blocks that participate in assistant rendering. */
 function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
+    !isSubagentActivityBlock(b) &&
     b.type !== "user_message" &&
     b.type !== "compaction" &&
     // compaction_loading has its own top-level bubble slot and must not
@@ -1838,6 +1860,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "routing_decision" && b.kind === "routing_decision") {
     // Verdict fields are immutable per item, so the id alone identifies it.
     return a.itemId === b.itemId;
+  }
+  if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
+    return a.itemId === b.itemId && a.data === b.data;
   }
   return false;
 }

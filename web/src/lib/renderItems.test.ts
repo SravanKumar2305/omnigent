@@ -62,6 +62,74 @@ function mkExec(name: string, callId: string): ToolExecution {
   };
 }
 
+describe("sub-agent timeline events", () => {
+  const notice = (): AnyBlock => ({
+    type: "native_tool",
+    ctx: ctx({ itemId: "notice_1", responseId: "subagent_returned" }),
+    toolType: "subagent_activity",
+    label: "Sub-agent activity",
+    data: {
+      type: "resource_event",
+      event_type: "session.subagent.returned",
+      resource_type: "session",
+      resource_id: "child_1",
+      resource: { title: "Review" },
+    },
+  });
+  const work: AnyBlock = {
+    type: "tool_group",
+    ctx: ctx({ itemId: "parent_tool", responseId: "parent_turn" }),
+    executions: [mkExec("Agent", "call_1")],
+    iteration: 0,
+  };
+  const answer: AnyBlock = {
+    type: "text_done",
+    ctx: ctx({ itemId: "parent_answer", responseId: "parent_turn" }),
+    fullText: "The review is complete.",
+    hasCodeBlocks: false,
+  };
+
+  it("does not change a completed assistant bubble when a notice arrives later", () => {
+    const cache = createBubbleCache();
+    const before = buildBubbles([work, answer], null, cache);
+    const after = buildBubbles([work, answer, notice()], null, cache);
+
+    expect(after.map((bubble) => bubble.kind)).toEqual(["assistant", "subagent_activity"]);
+    expect(bubblesEqual(before[0]!, after[0]!)).toBe(true);
+    expect(lastRenderableAssistantIndex(after)).toBe(0);
+    expect(liveCandidateAssistantIndex(after)).toBe(0);
+  });
+
+  it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
+    const active: ActiveResponse | null = streaming
+      ? { responseId: "parent_turn", state: "streaming", error: null }
+      : null;
+    const bubbles = buildBubbles([work, notice()], active, undefined, [], true);
+    expect(bubbles[0]).toMatchObject({
+      kind: "assistant",
+      responseId: "parent_turn",
+      lifecycle: streaming ? "streaming" : "completed",
+      items: [{ kind: "tool", state: "input-available" }],
+    });
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
+  });
+
+  it("keeps timeline order and folds earlier work across a real assistant continuation", () => {
+    const cache = createBubbleCache();
+    const event = notice();
+    buildBubbles([work, event], null, cache);
+    const bubbles = buildBubbles([work, event, answer], null, cache);
+    expect(bubbles.map((bubble) => bubble.kind)).toEqual([
+      "assistant",
+      "subagent_activity",
+      "assistant",
+    ]);
+    expect(bubbles[0]).toMatchObject({ responseId: "parent_turn", continued: true });
+    expect(bubbles[1]).toMatchObject({ itemId: "notice_1" });
+    expect(bubbles[2]).toMatchObject({ responseId: "parent_turn", stableId: "parent_answer" });
+  });
+});
+
 describe("buildBubbles — bubble grouping", () => {
   it("UserMessageBlock + TextDone in same response → [user, assistant{ items: [text] }]", () => {
     const blocks: AnyBlock[] = [
