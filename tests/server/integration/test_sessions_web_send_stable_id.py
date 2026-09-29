@@ -8,6 +8,7 @@ seeded ``initial_items`` keep store-assigned ids.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -61,10 +62,18 @@ def test_build_new_item_ignores_unusable_stable_id(data: dict[str, Any]) -> None
     assert item.stable_id is None
 
 
-def _stub_runner(monkeypatch: pytest.MonkeyPatch) -> httpx.AsyncClient:
-    """Accept every forwarded turn with 202 so persist-before-forward completes."""
+def _stub_runner(
+    monkeypatch: pytest.MonkeyPatch, forwarded: list[dict[str, Any]] | None = None
+) -> httpx.AsyncClient:
+    """Accept every forwarded turn with 202, recording each body in ``forwarded``."""
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        if forwarded is not None:
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
     fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        transport=httpx.MockTransport(accept),
         base_url="http://runner",
     )
 
@@ -81,7 +90,8 @@ async def test_web_send_persists_under_its_stable_id_and_dedupes_a_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End to end through the store: the persisted item's id IS the stable id, once."""
-    fake_runner = _stub_runner(monkeypatch)
+    forwarded: list[dict[str, Any]] = []
+    fake_runner = _stub_runner(monkeypatch, forwarded)
     try:
         agent = await create_test_agent(client)
         create = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
@@ -99,6 +109,44 @@ async def test_web_send_persists_under_its_stable_id_and_dedupes_a_retry(
 
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     assert [it["id"] for it in items if it["type"] == "message"] == [_STABLE_ID]
+    # The retry is the same send, so it is still dispatched (its first forward
+    # may have died) -- against the one persisted item, never a second copy.
+    turns = [turn for turn in forwarded if turn.get("type") == "message"]
+    assert [turn["persisted_item_id"] for turn in turns] == [_STABLE_ID, _STABLE_ID]
+
+
+@pytest.mark.asyncio
+async def test_web_send_rejects_a_different_body_under_a_persisted_stable_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stable id names one message: other content under it is refused, not run."""
+    forwarded: list[dict[str, Any]] = []
+    fake_runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        agent = await create_test_agent(client)
+        create = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert create.status_code == 201, create.text
+        session_id = create.json()["id"]
+        events = f"/v1/sessions/{session_id}/events"
+
+        first = await client.post(events, json={"type": "message", "data": _user_message()})
+        assert first.status_code == 202, first.text
+        # An edited draft (or any client) reusing the persisted id: the store
+        # would dedupe it to the ORIGINAL item, so the new text must not run.
+        edited = _user_message()
+        edited["content"] = [{"type": "input_text", "text": f"{_TEXT}, but edited"}]
+        conflict = await client.post(events, json={"type": "message", "data": edited})
+        assert conflict.status_code == 409, conflict.text
+    finally:
+        await fake_runner.aclose()
+
+    turns = [turn for turn in forwarded if turn.get("type") == "message"]
+    assert [turn["content"][0]["text"] for turn in turns] == [_TEXT]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    messages = [it for it in items if it["type"] == "message"]
+    assert [it["id"] for it in messages] == [_STABLE_ID]
+    assert messages[0]["content"][0]["text"] == _TEXT
 
 
 @pytest.mark.asyncio

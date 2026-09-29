@@ -303,6 +303,7 @@ from omnigent.server.routes._sessions.helpers import (
     _query_host_runner_status,
     _read_state_entry,
     _record_daily_cost,
+    _reject_conflicting_stable_id_reuse,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _relay_persist,
@@ -5884,6 +5885,12 @@ async def _forward_event_to_runner(
         session_id,
         [item],
     )
+    if item.stable_id is not None and persisted_items[0].deduplicated:
+        # The client id already named an item, so the store handed that item
+        # back instead of inserting. A retry of the same send still goes to the
+        # runner (its first forward may have died); anything else must not run
+        # under an item that does not hold it.
+        _reject_conflicting_stable_id_reuse(persisted_items[0], item)
     await _seed_missing_title_from_user_message(
         conv,
         item,

@@ -2108,12 +2108,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // screen. `pinnedSetter` routes every write for this send there.
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
-    const retryId =
-      pinnedId === null
-        ? get().pendingRetryStableId
-        : (setterForState(pinnedId)?.pendingRetryStableId ?? null);
+    const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
+    const retryId = pinnedState?.pendingRetryStableId ?? null;
     if (retryId !== null) pinnedSetter({ pendingRetryStableId: null });
-    const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
+    // A restored failed send keeps its stable id only when resent untouched:
+    // the server persists a web send under that id and dedupes a repeat, so an
+    // edited body under the old id would run without ever being persisted.
+    const reusableRetryId =
+      retryId !== null &&
+      restoredSendDraftUnchanged(
+        pinnedState?.restoredSendDraft ?? null,
+        retryId,
+        text,
+        files,
+        opts?.replyDraft,
+      )
+        ? retryId
+        : null;
+    const stableId = opts?.stableId ?? reusableRetryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -5995,6 +6007,37 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
 
 export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
+}
+
+/**
+ * Whether a resend matches the restored failed-send draft exactly.
+ *
+ * Only then may it reuse the draft's stable id: the server dedupes a repeated
+ * id to the item already persisted, so changed text, reply metadata or
+ * attachments must go out under a fresh id.
+ *
+ * @param restored - The restored draft being tracked, if any.
+ * @param stableId - The retry id about to be reused.
+ * @param text - Outgoing text.
+ * @param files - Outgoing attachments.
+ * @param replyDraft - Outgoing reply metadata.
+ * @returns `true` when nothing differs, or when no draft is tracked for the id.
+ */
+function restoredSendDraftUnchanged(
+  restored: ConversationState["restoredSendDraft"],
+  stableId: string,
+  text: string,
+  files: File[] | undefined,
+  replyDraft: StoredReplyDraft | undefined,
+): boolean {
+  if (restored === null || restored.stableId !== stableId) return true;
+  const outgoing = files ?? [];
+  return (
+    restored.text === text &&
+    outgoing.length === restored.files.length &&
+    outgoing.every((file) => restored.files.includes(file)) &&
+    JSON.stringify(restored.replyDraft ?? null) === JSON.stringify(replyDraft ?? null)
+  );
 }
 
 /**

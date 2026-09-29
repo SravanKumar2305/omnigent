@@ -7067,6 +7067,35 @@ def _web_send_stable_id(body: SessionEventInput) -> str | None:
     return None
 
 
+def _reject_conflicting_stable_id_reuse(
+    persisted: ConversationItem, item: NewConversationItem
+) -> None:
+    """
+    Refuse a send whose stable id already names a different item.
+
+    The store answers a repeated ``stable_id`` with the persisted item instead of
+    inserting, which is right for the retry of a send whose acknowledgement was
+    lost. Any other body under that id (edited text, other attachments, another
+    author) would then run on the runner while history kept the old item, so it
+    is rejected before anything is forwarded.
+
+    :param persisted: The item the store returned, flagged ``deduplicated``.
+    :param item: The item built from the request being persisted.
+    :raises OmnigentError: ``CONFLICT`` when type, author or payload differ.
+    """
+    if (
+        persisted.type == item.type
+        and persisted.created_by == item.created_by
+        and persisted.data.model_dump(mode="json", by_alias=True)
+        == item.data.model_dump(mode="json", by_alias=True)
+    ):
+        return
+    raise OmnigentError(
+        f"stable_id {item.stable_id!r} already names a different item in this session",
+        code=ErrorCode.CONFLICT,
+    )
+
+
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:
     """
     Validate and unpack a structured skill slash-command event.
