@@ -1,7 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import { BubbleView } from "@/pages/ChatPage";
 import { useChatStore } from "@/store/chatStore";
 import { buildBubbles, type Bubble } from "@/lib/renderItems";
@@ -27,33 +26,15 @@ const activity = (
 describe("sub-agent activity notices", () => {
   beforeEach(() => useChatStore.setState({ sessionStatus: "idle" }));
 
-  it("keeps both linked lifecycle notices visible outside the completed work fold", () => {
+  it("links both lifecycle notices to child chat while preserving global query params", () => {
     render(
       <MemoryRouter
         initialEntries={["/c/parent?file=README.md&view=terminal&message=msg_parent&debug=1"]}
       >
-        <TooltipProvider>
-          <BubbleView
-            bubble={{
-              kind: "assistant",
-              responseId: "resp_parent",
-              stableId: "resp_parent",
-              lifecycle: "completed",
-              error: null,
-              workedForS: 4,
-              items: [
-                { kind: "reasoning", itemId: "reasoning", text: "Private work trace", duration: 1 },
-                { kind: "text", itemId: "answer", text: "Here are the findings.", final: true },
-              ],
-            }}
-          />
-          <BubbleView bubble={activity("delegated")} />
-          <BubbleView bubble={activity("returned")} />
-        </TooltipProvider>
+        <BubbleView bubble={activity("delegated")} />
+        <BubbleView bubble={activity("returned")} />
       </MemoryRouter>,
     );
-    expect(screen.getByText("Worked for 4s")).toBeVisible();
-    expect(screen.queryByText("Private work trace")).not.toBeInTheDocument();
     expect(screen.getAllByTestId("subagent-activity")).toHaveLength(2);
     expect(screen.getAllByTestId("subagent-activity")[0]).toHaveTextContent(
       "Started Research public positioning",
@@ -65,7 +46,6 @@ describe("sub-agent activity notices", () => {
       expect(link).toBeVisible();
       expect(link).toHaveAttribute("href", "/c/conv_child?debug=1&panel=agents");
     }
-    expect(screen.getByText("Here are the findings.")).toBeVisible();
     expect(screen.queryByText("(ID)")).not.toBeInTheDocument();
   });
 

@@ -42,7 +42,7 @@ def native_subagent_terminal_status(
         return turn_outcome
     if status == "failed":
         return "failed"
-    if harness == "claude-native" and turn_completed is not True:
+    if harness in {None, "claude-native"} and turn_completed is not True:
         return None
     return "completed"
 
@@ -148,33 +148,25 @@ async def record_claude_subagent_return(
     parent_id: str,
     item: NewConversationItem | ConversationItem,
     store: ConversationStore,
-    *,
-    subagent_return_id: object = None,
 ) -> None:
     """Match an actual Claude result to its child; launch handles are not results."""
     try:
-        await _record_claude_subagent_return(
-            parent_id, item, store, subagent_return_id=subagent_return_id
-        )
+        await _record_claude_subagent_return(parent_id, item, store)
     except Exception:  # noqa: BLE001 — optional correlation must not interrupt transcript delivery
         _logger.warning("Could not match Claude subagent result in %s", parent_id, exc_info=True)
 
 
 def _claude_completion_ids(
     item: NewConversationItem | ConversationItem,
-    *,
-    subagent_return_id: object = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     task_ids: dict[str, str] = {}
-    if isinstance(subagent_return_id, str) and subagent_return_id:
-        task_ids[subagent_return_id] = "completed"
     call_ids: dict[str, str] = {}
-    if isinstance(item.data, FunctionCallOutputData):
-        output = item.data.output
-        if "Async agent launched successfully" in output or '"async_launched"' in output:
-            return {}, {}
-        call_ids[item.data.call_id] = "completed"
-    elif isinstance(item.data, MessageData) and item.data.is_meta:
+    if isinstance(item.data, FunctionCallOutputData) or (
+        isinstance(item.data, MessageData) and item.data.is_meta
+    ):
+        if item.data.subagent_return_id:
+            task_ids[item.data.subagent_return_id] = "completed"
+    if isinstance(item.data, MessageData) and item.data.is_meta:
         for block in item.data.content:
             text = block.get("text")
             if not isinstance(text, str):
@@ -196,10 +188,8 @@ async def _record_claude_subagent_return(
     parent_id: str,
     item: NewConversationItem | ConversationItem,
     store: ConversationStore,
-    *,
-    subagent_return_id: object,
 ) -> None:
-    task_ids, call_ids = _claude_completion_ids(item, subagent_return_id=subagent_return_id)
+    task_ids, call_ids = _claude_completion_ids(item)
     if not task_ids and not call_ids:
         return
     after: str | None = None

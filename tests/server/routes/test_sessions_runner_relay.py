@@ -267,8 +267,11 @@ class _ScriptedRunnerClient:
         return _ScriptedStreamResponse(self._release, self._events)
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
 @pytest.mark.asyncio
-async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(db_uri: str) -> None:
+async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
+    db_uri: str, outcome: str
+) -> None:
     from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
 
     store = SqlAlchemyConversationStore(db_uri)
@@ -298,9 +301,9 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(db_ur
         {"type": "response.completed", "response": {"id": "first"}},
         {"type": "response.in_progress", "response": {"id": "second", "model": "test"}},
         {"type": "response.output_text.delta", "delta": "Finished the full task."},
-        {"type": "response.completed", "response": {"id": "second"}},
-        {"type": "session.status", "status": "idle"},
-        {"type": "session.status", "status": "idle"},
+        {"type": f"response.{outcome}", "response": {"id": "second"}},
+        {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
+        {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
     ]
     await _relay_runner_stream_once(
         child.id,
@@ -312,6 +315,7 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(db_ur
         "session.subagent.delegated",
         "session.subagent.returned",
     ]
+    assert items[-1].data.resource["status"] == outcome
 
 
 @pytest.mark.asyncio

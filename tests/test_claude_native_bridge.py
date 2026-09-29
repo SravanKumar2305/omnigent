@@ -1291,7 +1291,7 @@ _TEAMMATE_MESSAGE = (
         ("The findings are ready.", {"kind": "peer", "from": "researcher"}),
     ],
 )
-def test_read_transcript_items_marks_teammate_messages_meta(
+def test_read_transcript_items_distinguishes_teammate_provenance(
     tmp_path: Path, as_blocks: bool, text: str, origin: dict[str, str] | None
 ) -> None:
     transcript = tmp_path / "session.jsonl"
@@ -1315,9 +1315,10 @@ def test_read_transcript_items_marks_teammate_messages_meta(
     assert len(items) == 1
     assert items[0].data == {
         "role": "user",
-        "is_meta": True,
+        **({"is_meta": True} if origin is not None else {}),
         "content": [{"type": "input_text", "text": text}],
     }
+    assert items[0].agent_message_candidate is (origin is None)
 
 
 @pytest.mark.parametrize(
@@ -1357,7 +1358,10 @@ def test_read_transcript_items_keeps_human_text_and_tool_results_with_teammate_b
 
     visible = [item for item in items if not item.data.get("is_meta")]
     assert [item.item_type for item in visible] == ["message", "function_call_output"]
-    assert visible[0].data["content"] == [{"type": "input_text", "text": human_text}]
+    assert visible[0].data["content"] == [
+        {"type": "input_text", "text": _TEAMMATE_MESSAGE},
+        {"type": "input_text", "text": human_text},
+    ]
     assert visible[1].data == {"call_id": "tool-1", "output": "done"}
     assert visible[1].response_id == "resp_active"
 
@@ -1366,8 +1370,8 @@ def test_read_transcript_items_keeps_human_text_and_tool_results_with_teammate_b
     ("prompt", "metadata"),
     [
         ("The subagent finished.", {"isMeta": True}),
-        (_TEAMMATE_MESSAGE, {}),
-        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, {}),
+        (_TEAMMATE_MESSAGE, {"origin": {"kind": "peer"}}),
+        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, {"isMeta": True}),
         ("The findings are ready.", {"origin": {"kind": "peer"}}),
         ("<task-notification><task-id>task-1</task-id></task-notification>", {}),
     ],
@@ -1414,6 +1418,7 @@ def test_teammate_message_preserves_active_assistant_response(
             {
                 "type": "user",
                 "uuid": "teammate",
+                "origin": {"kind": "peer"},
                 "message": {
                     "role": "user",
                     "content": [{"type": "text", "text": _TEAMMATE_MESSAGE}]
@@ -1531,7 +1536,20 @@ def test_partial_meta_completion_never_becomes_user_message(
     assert response_id == "active"
 
 
-def test_meta_completion_companion_text_stays_hidden(tmp_path: Path) -> None:
+@pytest.mark.parametrize("companion_first", [False, True])
+def test_meta_completion_companion_text_stays_hidden(
+    tmp_path: Path, companion_first: bool
+) -> None:
+    blocks = [
+        {
+            "type": "text",
+            "text": "<task-notification><task-id>agent-1</task-id>"
+            "<status>completed</status></task-notification>",
+        },
+        {"type": "text", "text": "Internal completion guidance."},
+    ]
+    if companion_first:
+        blocks.reverse()
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(
         _transcript_line(
@@ -1540,14 +1558,7 @@ def test_meta_completion_companion_text_stays_hidden(tmp_path: Path) -> None:
                 "isMeta": True,
                 "message": {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "<task-notification><task-id>agent-1</task-id>"
-                            "<status>completed</status></task-notification>",
-                        },
-                        {"type": "text", "text": "Internal completion guidance."},
-                    ],
+                    "content": blocks,
                 },
             }
         ),

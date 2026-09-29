@@ -114,6 +114,27 @@ describe("sub-agent timeline events", () => {
     expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
   });
 
+  it("keeps a steered parent response expanded across a subagent notice", () => {
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "steering", responseId: "parent_turn" }),
+      content: [{ type: "input_text", text: "Include the API change too." }],
+    };
+    const bubbles = buildBubbles([work, notice(), user, answer], null);
+
+    expect(bubbles.map((bubble) => bubble.kind)).toEqual([
+      "assistant",
+      "subagent_activity",
+      "user",
+      "assistant",
+    ]);
+    expect(bubbles[3]).toMatchObject({
+      responseId: "parent_turn",
+      defaultExpanded: true,
+      items: [{ kind: "text", text: "The review is complete." }],
+    });
+  });
+
   it("keeps timeline order and folds earlier work across a real assistant continuation", () => {
     const cache = createBubbleCache();
     const event = notice();

@@ -196,6 +196,19 @@ describe("itemsToBlocks — flat shape", () => {
     ]);
   });
 
+  it.each([
+    '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
+    '<agent-message from="reviewer">Review this</agent-message>',
+  ])("preserves a human's bare envelope after reload: %s", (text) => {
+    for (const authorship of [{ created_by: "alice@example.com" }, { user_authored: true }]) {
+      const item = { ...userMessage("resp_user", text), ...authorship };
+      expect(itemsToBlocks([item])).toMatchObject([
+        { type: "user_message", content: [{ type: "input_text", text }] },
+      ]);
+      expect(itemsToBlocks([{ ...item, is_meta: true }])).toEqual([]);
+    }
+  });
+
   it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
     const envelope =
       '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';

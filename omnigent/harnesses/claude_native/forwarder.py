@@ -1791,6 +1791,7 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
                 if item.subagent_return_id is not None
                 else {}
             ),
+            **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
         },
     }
 
@@ -5151,6 +5152,7 @@ async def _post_external_conversation_item(
                         if item.subagent_return_id is not None
                         else {}
                     ),
+                    **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
                 },
             },
         )

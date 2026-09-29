@@ -251,6 +251,9 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     };
   }
   if (isMessageItem(item) && item.role === "user") {
+    if (!item.is_meta && (item.created_by || item.user_authored === true)) {
+      return userMessageToBlock(item);
+    }
     if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and

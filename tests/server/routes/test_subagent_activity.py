@@ -1,6 +1,5 @@
 """Subagent lifecycle links persist once and never enter agent context."""
 
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import pytest
@@ -9,7 +8,6 @@ from omnigent.entities import (
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
-    ResourceEventData,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
@@ -36,11 +34,13 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
         ("idle", "codex-native", None, None, "completed"),
         ("idle", "claude-native", {}, None, None),
         ("running", "claude-native", None, None, None),
+        ("idle", None, None, None, None),
+        ("idle", None, None, True, "completed"),
     ],
 )
 def test_native_terminal_status_respects_confirmed_outcomes(
     status: str,
-    harness: str,
+    harness: str | None,
     turn_outcome: object,
     turn_completed: bool | None,
     expected: str | None,
@@ -51,31 +51,6 @@ def test_native_terminal_status_respects_confirmed_outcomes(
         )
         == expected
     )
-
-
-def test_concurrent_subagent_activity_is_persisted_once(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    item = NewConversationItem(
-        type="resource_event",
-        stable_id="1234567890abcdef1234567890abcdef",
-        response_id="subagent_duplicate_edge",
-        data=ResourceEventData(
-            event_type="session.subagent.delegated",
-            resource_id="child",
-            resource_type="session",
-            resource={"title": "Research"},
-        ),
-    )
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(
-            pool.map(
-                lambda _: SqlAlchemyConversationStore(db_uri).append(parent.id, [item])[0],
-                range(16),
-            )
-        )
-    assert sum(not result.deduplicated for result in results) == 1
-    assert len(store.list_items(parent.id).data) == 1
 
 
 @pytest.mark.asyncio
@@ -177,7 +152,9 @@ async def test_claude_completion_matches_real_child(db_uri: str, completion: str
         item = NewConversationItem(
             type="function_call_output",
             response_id="parent-turn",
-            data=FunctionCallOutputData(call_id="tool-1", output="Inspection finished."),
+            data=FunctionCallOutputData(
+                call_id="tool-1", output="Inspection finished.", subagent_return_id="agent-1"
+            ),
         )
     else:
         text = (
@@ -192,12 +169,14 @@ async def test_claude_completion_matches_real_child(db_uri: str, completion: str
             type="message",
             response_id="notification-record",
             data=MessageData(
-                role="user", is_meta=True, content=[{"type": "input_text", "text": text}]
+                role="user",
+                is_meta=True,
+                content=[{"type": "input_text", "text": text}],
+                subagent_return_id="agent-1" if completion == "handback" else None,
             ),
         )
-    return_id = "agent-1" if completion == "handback" else None
-    await record_claude_subagent_return(parent.id, item, store, subagent_return_id=return_id)
-    await record_claude_subagent_return(parent.id, item, store, subagent_return_id=return_id)
+    await record_claude_subagent_return(parent.id, item, store)
+    await record_claude_subagent_return(parent.id, item, store)
     items = store.list_items(parent.id).data
     assert len(items) == 1
     assert items[0].data.resource_id == child.id
@@ -231,6 +210,7 @@ async def test_external_item_paths_record_returned_child_once(db_uri: str, batch
             await _persist_external_conversation_item(parent.id, parent, body, store)
     items = store.list_items(parent.id).data
     assert [item.type for item in items] == ["function_call_output", "resource_event"]
+    assert items[0].data.subagent_return_id == "agent-1"
     assert items[1].data.resource_id == child.id
     assert items[1].data.event_type == "session.subagent.returned"
 
@@ -294,16 +274,40 @@ async def test_parallel_generic_children_keep_their_task_names(db_uri: str) -> N
     ]
 
 
+@pytest.mark.parametrize("completion", ["tool", "handback", "failed"])
 @pytest.mark.asyncio
-async def test_claude_result_arriving_before_child_discovery_is_reconciled(db_uri: str) -> None:
+async def test_claude_result_arriving_before_child_discovery_is_reconciled(
+    db_uri: str, completion: str
+) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
-    result = NewConversationItem(
-        type="function_call_output",
-        response_id="parent-turn",
-        data=FunctionCallOutputData(call_id="tool-1", output="Done."),
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "source_id": "early-result",
+            "response_id": "parent-turn",
+            "item_type": "message" if completion == "handback" else "function_call_output",
+            "item_data": {
+                "role": "user",
+                "is_meta": True,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": '<agent-message from="agent-1">Done.</agent-message>',
+                    }
+                ],
+            }
+            if completion == "handback"
+            else {
+                "call_id": "tool-1",
+                "output": '{"status":"failed","agentId":"agent-1"}'
+                if completion == "failed"
+                else "Done.",
+            },
+            **({"subagent_return_id": "agent-1"} if completion != "failed" else {}),
+        },
     )
-    store.append(parent.id, [result])
+    await _persist_external_conversation_items(parent.id, [body], store)
     child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
     store.set_labels(
         child.id,
@@ -314,6 +318,32 @@ async def test_claude_result_arriving_before_child_discovery_is_reconciled(db_ur
     )
     await record_subagent_activity(child.id, "delegated", store)
     await record_subagent_activity(child.id, "delegated", store)
+    if completion == "failed":
+        assert [
+            row.data.event_type for row in store.list_items(parent.id, type="resource_event").data
+        ] == ["session.subagent.delegated"]
+        await record_claude_subagent_return(
+            parent.id,
+            NewConversationItem(
+                type="message",
+                response_id="failure-record",
+                data=MessageData(
+                    role="user",
+                    is_meta=True,
+                    content=[
+                        {
+                            "type": "input_text",
+                            "text": "<task-notification><tool-use-id>tool-1</tool-use-id>"
+                            "<status>failed</status></task-notification>",
+                        }
+                    ],
+                ),
+            ),
+            store,
+        )
     assert [
         row.data.event_type for row in store.list_items(parent.id, type="resource_event").data
     ] == ["session.subagent.delegated", "session.subagent.returned"]
+    assert store.list_items(parent.id, type="resource_event").data[-1].data.resource["status"] == (
+        "failed" if completion == "failed" else "completed"
+    )

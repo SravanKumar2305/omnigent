@@ -2749,9 +2749,14 @@ async def _persist_external_conversation_item_unlocked(
         # Skipped older entries are persisted as undelivered. A miss falls back
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
+        agent_message_candidate = body.data.get("agent_message_candidate") is True
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
-        if item.stable_id is not None or _is_kiro_native_session(conv):
+        if agent_message_candidate:
+            # Ambiguous markup can be direct terminal input. Only its exact
+            # pending match is evidence of a web submission; preserve others.
+            held_older = [*matched.skipped, *matched.uncertain]
+        elif item.stable_id is not None or _is_kiro_native_session(conv):
             skipped_pending = matched.skipped
             # Jumped-over entries that a positional drain may already have
             # settled: drained without an undelivered record.
@@ -2762,7 +2767,7 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not _is_kiro_native_session(conv):
+        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 # The mirror's true owner may be any entry still queued, so none
@@ -2788,6 +2793,10 @@ async def _persist_external_conversation_item_unlocked(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+        if agent_message_candidate:
+            item = item.model_copy(
+                update={"data": item.data.model_copy(update={"user_authored": True})}
+            )
     elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
         # A command typed in the web composer was queued as plain text but comes
         # back as a slash_command item. Drain its own entry so it is not later
@@ -2866,6 +2875,16 @@ def _new_external_conversation_item(
 ) -> NewConversationItem:
     """Parse an external item event, keyed by its ``source_id`` when it has one."""
     item = _parse_external_conversation_item(body)
+    return_id = body.data.get("subagent_return_id")
+    if (
+        isinstance(return_id, str)
+        and return_id
+        and isinstance(item.data, (MessageData, FunctionCallOutputData))
+    ):
+        # Child discovery can lag behind the result; retain its explicit provenance.
+        item = item.model_copy(
+            update={"data": item.data.model_copy(update={"subagent_return_id": return_id})}
+        )
     # An at-least-once producer (the native transcript forwarders) retries a
     # timed-out POST it cannot know the disposition of, so the item's id is
     # derived from its ``source_id`` and the append is idempotent — the
@@ -2908,20 +2927,10 @@ async def _publish_persisted_external_item(
         message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
-    if (
-        body.data.get("subagent_return_id")
-        or (isinstance(persisted.data, MessageData) and persisted.data.is_meta)
-        or (
-            isinstance(persisted.data, FunctionCallOutputData)
-            and "agentId:" in persisted.data.output
-        )
+    if (isinstance(persisted.data, MessageData) and persisted.data.is_meta) or (
+        isinstance(persisted.data, FunctionCallOutputData) and persisted.data.subagent_return_id
     ):
-        await record_claude_subagent_return(
-            session_id,
-            persisted,
-            conversation_store,
-            subagent_return_id=body.data.get("subagent_return_id"),
-        )
+        await record_claude_subagent_return(session_id, persisted, conversation_store)
 
 
 async def _persist_external_conversation_items(
@@ -3012,7 +3021,7 @@ async def _settle_undelivered_native_input(
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        data=MessageData(role="user", content=drained.content),
+        data=MessageData(role="user", content=drained.content, user_authored=True),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
     )
@@ -3113,7 +3122,7 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content),
+                data=MessageData(role="user", content=skipped.content, user_authored=True),
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,

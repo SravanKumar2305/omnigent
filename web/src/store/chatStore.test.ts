@@ -7475,6 +7475,95 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       },
     );
 
+    it.each([
+      '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
+      '<agent-message from="reviewer">Review this</agent-message>',
+    ])("acknowledges a human's bare envelope without hiding it: %s", (text) => {
+      const content = [{ type: "input_text" as const, text }];
+      for (const authorship of [
+        { createdBy: "alice@example.com" },
+        { userAuthored: true },
+        { clearedPendingId: "pending_xml" },
+      ]) {
+        useChatStore.setState({
+          blocks: [],
+          pendingUserMessages: [{ tempId: "pending_xml", content }],
+        });
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "msg_user_xml",
+          itemType: "message",
+          ...authorship,
+          data: { role: "user", content, user_authored: "userAuthored" in authorship },
+        });
+
+        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+        expect(useChatStore.getState().blocks).toMatchObject([
+          {
+            type: "user_message",
+            ctx: { itemId: "msg_user_xml" },
+            stableKey: "pending_xml",
+            content,
+          },
+        ]);
+      }
+    });
+
+    it("keeps unrelated input queued when bare XML is typed directly in the terminal", () => {
+      const content = [
+        {
+          type: "input_text" as const,
+          text: '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
+        },
+      ];
+      const pending = [
+        { tempId: "pending_web", content: [{ type: "input_text" as const, text: "Still queued" }] },
+      ];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+      const event: SessionInputConsumedEvent = {
+        type: "session_input_consumed",
+        itemId: "msg_tui_xml",
+        itemType: "message",
+        data: { role: "user", content, user_authored: true },
+      };
+      handleSessionEvent(event);
+      handleSessionEvent(event);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      expect(useChatStore.getState().blocks).toMatchObject([
+        { type: "user_message", ctx: { itemId: "msg_tui_xml" }, content },
+      ]);
+    });
+
+    it("uses the named acknowledgement for a bare envelope while keeping other input queued", () => {
+      const content = [
+        {
+          type: "input_text" as const,
+          text: '<agent-message from="reviewer">Review this</agent-message>',
+        },
+      ];
+      const unrelated = {
+        tempId: "pending_other",
+        content: [{ type: "input_text" as const, text: "Still queued" }],
+      };
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [unrelated, { tempId: "pending_xml", content }],
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_user_xml",
+        itemType: "message",
+        clearedPendingId: "pending_xml",
+        data: { role: "user", content },
+      });
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
+      expect(useChatStore.getState().blocks).toMatchObject([
+        { type: "user_message", stableKey: "pending_xml", content },
+      ]);
+    });
+
     it("renders a user asking about a teammate message in the live transcript", () => {
       const content = [
         {

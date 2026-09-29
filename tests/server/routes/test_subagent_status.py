@@ -332,29 +332,42 @@ async def test_external_session_status_still_forwards_to_runner(
 
 
 @pytest.mark.parametrize(
-    ("harness", "confirmation", "expected"),
+    ("harness", "status", "confirmation", "wrapper", "expected"),
     [
-        ("claude-native", {}, None),
-        ("claude-native", {"turn_completed": True}, "completed"),
-        ("cursor-native", {"turn_outcome": "cancelled"}, "cancelled"),
-        ("cursor-native", {"turn_outcome": "failed"}, "failed"),
-        ("codex-native", {}, "completed"),
+        ("claude-native", "idle", {}, None, None),
+        ("claude-native", "idle", {"turn_completed": True}, None, "completed"),
+        ("cursor-native", "idle", {"turn_outcome": "cancelled"}, None, "cancelled"),
+        ("cursor-native", "idle", {"turn_outcome": "failed"}, None, "failed"),
+        ("codex-native", "idle", {}, None, "completed"),
+        ("claude-native", "failed", {}, None, "failed"),
+        (
+            "claude-native",
+            "idle",
+            {"turn_completed": True},
+            "claude-code-native-ui-subagent",
+            None,
+        ),
+        ("claude-native", "failed", {}, "claude-code-native-ui-subagent", None),
     ],
 )
 async def test_external_child_activity_uses_confirmed_outcome(
     status_route: _StatusRoute,
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
+    status: str,
     confirmation: dict[str, Any],
+    wrapper: str | None,
     expected: str | None,
 ) -> None:
     route = status_route
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
     monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: harness)
     response = await route.client.post(
         f"/v1/sessions/{route.child_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": "idle", "response_id": "child-turn", **confirmation},
+            "data": {"status": status, "response_id": "child-turn", **confirmation},
         },
     )
     assert response.status_code == 202, response.text

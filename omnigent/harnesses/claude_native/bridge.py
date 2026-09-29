@@ -806,6 +806,8 @@ class ClaudeTranscriptItem:
         as a bubble. Defaults to ``False``.
     :param subagent_return_id: Claude's native task id for an explicit
         handback; transported separately from model-visible message content.
+    :param agent_message_candidate: Unproven team-shaped user text; the server
+        must correlate it by text without draining unrelated pending input.
     """
 
     source_id: str
@@ -815,6 +817,7 @@ class ClaudeTranscriptItem:
     is_compact_summary: bool = False
     is_compact_noop: bool = False
     subagent_return_id: str | None = None
+    agent_message_candidate: bool = False
 
 
 @dataclass(frozen=True)
@@ -3211,6 +3214,7 @@ def read_transcript_items_from_offset(
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
     include_sidechains: bool = False,
+    legacy_agent_messages: bool = False,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -3239,6 +3243,8 @@ def read_transcript_items_from_offset(
         leave the sub-agent's child Omnigent conversation empty. The
         default ``False`` keeps the parent-transcript path
         unchanged.
+    :param legacy_agent_messages: Offline imports hide unproven historical
+        team envelopes; preserve assistant response identity across them.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -3272,6 +3278,7 @@ def read_transcript_items_from_offset(
                 TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
             )
             continue
+        previous_response_id = active_response_id
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -3281,6 +3288,8 @@ def read_transcript_items_from_offset(
             settled_response_id=active_settled_id,
             include_sidechains=include_sidechains,
         )
+        if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
+            active_response_id = previous_response_id
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
         # the compact summary AND the resumed output must not parse the
@@ -7805,7 +7814,7 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("isMeta") is True:
         return current_response_id, []
-    if _is_agent_notification_text(prompt, origin=attachment.get("origin")):
+    if _is_trusted_agent_notification_text(prompt, origin=attachment.get("origin")):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     item = ClaudeTranscriptItem(
@@ -7816,6 +7825,9 @@ def _attachment_transcript_items_from_entry(
             "content": [{"type": "input_text", "text": _unwrap_pasted_content_markers(prompt)}],
         },
         response_id=_response_id_from_source(source_key),
+        agent_message_candidate=_is_agent_notification_text(
+            _unwrap_pasted_content_markers(prompt)
+        ),
     )
     return None, [item]
 
@@ -8181,15 +8193,21 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
-def _is_agent_notification_text(text: str, *, origin: object = None) -> bool:
-    """Identify Claude task and teammate context that is not a human prompt."""
+def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
+    """Honor native peer provenance and the existing task-notification boundary."""
     if isinstance(origin, dict) and origin.get("kind") == "peer":
         return True
     stripped = text.lstrip()
-    if stripped.startswith("<task-notification>") and all(
+    return stripped.startswith("<task-notification>") and all(
         marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
-    ):
+    )
+
+
+def _is_agent_notification_text(text: str) -> bool:
+    """Recognize possible agent context; text alone does not prove its origin."""
+    if _is_trusted_agent_notification_text(text):
         return True
+    stripped = text.lstrip()
     wrapped = False
     for prefix in _TEAMMATE_MESSAGE_PREFIXES:
         if stripped.startswith(prefix):
@@ -8381,12 +8399,22 @@ def _user_transcript_items_from_entry(
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
     return_id = _subagent_handback_id(entry.get("origin"))
-    notification_text = content if isinstance(content, str) else _summary_text_from_blocks(content)
+    notification_texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
     # Keep hidden completion provenance so the parent can link the returned child.
     if (
         entry.get("isMeta") is True
         and return_id is None
-        and not _is_task_completion_text(notification_text)
+        and not any(_is_task_completion_text(text) for text in notification_texts)
     ):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
@@ -8425,7 +8453,7 @@ def _user_transcript_items_from_entry(
     if isinstance(content, str):
         if not content:
             return current_response_id, []
-        if entry.get("isMeta") is True or _is_agent_notification_text(
+        if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
             content, origin=entry.get("origin")
         ):
             items.append(
@@ -8513,6 +8541,9 @@ def _user_transcript_items_from_entry(
                     ],
                 },
                 response_id=fallback_response_id,
+                agent_message_candidate=_is_agent_notification_text(
+                    _unwrap_pasted_content_markers(content)
+                ),
             )
         )
         return None, items
@@ -8531,7 +8562,7 @@ def _user_transcript_items_from_entry(
             text = block.get("text")
             if not isinstance(text, str) or not text:
                 continue
-            if entry.get("isMeta") is True or _is_agent_notification_text(
+            if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
                 text, origin=entry.get("origin")
             ):
                 items.append(
@@ -8550,13 +8581,8 @@ def _user_transcript_items_from_entry(
                 item_index += 1
                 saw_user_text = saw_user_text or text.lstrip().startswith("<task-notification>")
                 continue
-            # Defensively guard against slash-command markup or other
-            # CLI-scaffolding markers ever arriving in list-form
-            # content. Today these only ship in string content (the
-            # branch above), but Claude Code's JSONL format is not
-            # under our control — without this filter, a format
-            # change would regress to rendering ``<command-name>…``
-            # markup as a user bubble.
+            # Claude may emit CLI scaffolding as text blocks; never render it
+            # as user input when the transcript shape changes.
             stripped = text.lstrip()
             if "<command-name>" in stripped or any(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
@@ -8600,6 +8626,11 @@ def _user_transcript_items_from_entry(
                     "content": user_blocks,
                 },
                 response_id=fallback_response_id,
+                agent_message_candidate=all(
+                    isinstance(text := block.get("text"), str)
+                    and _is_agent_notification_text(text)
+                    for block in user_blocks
+                ),
             ),
         )
     return (None if saw_user_text else current_response_id), items

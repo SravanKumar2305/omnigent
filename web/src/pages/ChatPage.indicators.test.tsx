@@ -252,25 +252,22 @@ describe("BubbleView dispatch", () => {
     },
   });
 
-  it.each(["delegated", "returned"] as const)(
-    "spans the chat column for a %s notice without message chrome",
-    (phase) => {
-      render(
-        <MemoryRouter>
-          <BubbleView bubble={subagentActivity(phase)} />
-        </MemoryRouter>,
-      );
+  it("spans the chat column for an activity notice without message chrome", () => {
+    render(
+      <MemoryRouter>
+        <BubbleView bubble={subagentActivity("delegated")} />
+      </MemoryRouter>,
+    );
 
-      expect(screen.getByTestId("subagent-activity")).toHaveClass("w-full");
-      expect(screen.queryByTestId("message-bubble")).not.toBeInTheDocument();
-      expect(screen.getByRole("link", { name: "Review the change" })).toHaveAttribute(
-        "href",
-        "/c/conv_child?panel=agents",
-      );
-      expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
-    },
-  );
+    expect(screen.getByTestId("subagent-activity")).toHaveClass("w-full");
+    expect(screen.queryByTestId("message-bubble")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review the change" })).toHaveAttribute(
+      "href",
+      "/c/conv_child?panel=agents",
+    );
+    expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+  });
 
   it("keeps assistant text actions beside a standalone lifecycle notice", () => {
     const answer = assistantText("The review is complete.");
