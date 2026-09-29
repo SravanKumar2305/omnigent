@@ -150,6 +150,8 @@ import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nati
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
+  /** Dispatch a queued control instead of a text message. */
+  command?: "compact";
   /** Client-only quote provenance, retained if the composer needs to retry. */
   replyDraft?: StoredReplyDraft;
   /**
@@ -542,6 +544,7 @@ export interface PendingUserMessage {
  * directly (no serialization concern).
  */
 export interface QueuedMessage {
+  command?: "compact";
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
@@ -1053,7 +1056,7 @@ export interface AppChatState {
 
 /** Actions exposed on the root store. */
 export interface ChatActions {
-  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  send: (text: string, agentId: string | null, files?: File[], opts?: SendOptions) => Promise<void>;
   clearSideChatToOpen: () => void;
   /** Open a generic side chat as a rail tab under `parentId`, seeding its
    *  composer with `draft` (the typed `/side` question) so it isn't lost while
@@ -1066,7 +1069,12 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  enqueueMessage: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    command?: "compact",
+  ) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1222,11 +1230,10 @@ export interface ChatActions {
    *  successful `launchRunner` for the open session. */
   markRunnerLaunched: () => void;
   /**
-   * Compact the active session's context. Posts a ``compact`` event to the
-   * server, which summarises the conversation history in-place. No-ops when
-   * there is no active conversation.
+   * Queue or dispatch a ``compact`` control with the normal pending user bubble.
+   * No-ops when there is no active conversation.
    */
-  compact: () => Promise<void>;
+  compact: (opts?: { queue?: boolean }) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -1822,7 +1829,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files, replyDraft) => {
+  enqueueMessage: (text, files, replyDraft, command) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1834,6 +1841,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         {
           queueId,
           text,
+          ...(command ? { command } : {}),
           stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1887,7 +1895,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
-    if (target === undefined || agentId === null) return;
+    if (target === undefined || (agentId === null && !target.command)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
@@ -1896,7 +1904,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   steerAllQueuedMessages: (conversationId) => {
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-    if (own.length === 0 || own.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
+    if (own.length === 0 || own.some((m) => !m.command && (m.agentId ?? s.boundAgentId) === null))
+      return;
     const batchOrder = new Map(own.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
     setActive({
@@ -1904,7 +1913,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
     for (const m of own) {
       const agentId = m.agentId ?? s.boundAgentId;
-      if (agentId === null) continue;
       void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
     }
   },
@@ -1924,8 +1932,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the turn already ended and only background work (background shells /
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
-    // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
+    // an actively `running` turn gate the flush. Controls need no agent binding.
+    if (s.conversationId === null || s.sessionStatus === "running") {
       return;
     }
     if (s.status === "streaming") {
@@ -1951,6 +1959,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
     if (head === undefined || head.requiresRetry) return;
+    if (!head.command && (head.agentId ?? s.boundAgentId) === null) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2026,6 +2035,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
         await waitForPrior();
+        if (head.command) {
+          await postEvent(conversationId, { type: head.command, data: {} });
+          return;
+        }
         // Reuse prior successful uploads so cooldown-paced retries do not
         // orphan blobs that already landed.
         const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
@@ -2084,6 +2097,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
   },
   send: async (text, agentId, files, opts) => {
+    if (opts?.command === "compact") {
+      const id = opts.pinnedConversationId ?? get().conversationId;
+      if (!id) return;
+      try {
+        await sendCompact(id);
+      } catch (err) {
+        if (!opts.onError) throw err;
+        opts.onError(describeSendFailure(err).message);
+      }
+      return;
+    }
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
@@ -2836,10 +2860,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
-  compact: async () => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    await postEvent(conversationId, { type: "compact", data: {} });
+  compact: async (opts) => {
+    const s = get();
+    if (!s.conversationId) return;
+    if (opts?.queue) {
+      s.enqueueMessage("/compact", undefined, undefined, "compact");
+      return;
+    }
+    await sendCompact(s.conversationId);
   },
 
   refreshSessionState: async (conversationId) => {
@@ -3143,12 +3171,48 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
+/** Use the normal pending bubble; native transcript events reconcile it. */
+async function sendCompact(conversationId: string): Promise<void> {
+  const set = setterFor(conversationId);
+  const tempId = `pend_${++pendingSeq}`;
+  const author = getCurrentAuthorId();
+  set((s) => ({
+    pendingUserMessages: [
+      ...s.pendingUserMessages,
+      {
+        tempId,
+        content: [{ type: "input_text", text: "/compact" }],
+        createdAtS: Math.floor(Date.now() / 1000),
+        ...(author !== null ? { author } : {}),
+      },
+    ],
+  }));
+  const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+  try {
+    await waitForPrior();
+    await postEvent(conversationId, { type: "compact", data: {} });
+    set((s) => ({
+      pendingUserMessages: s.pendingUserMessages.map((p) =>
+        p.tempId === tempId ? { ...p, posted: true } : p,
+      ),
+    }));
+  } catch (err) {
+    set((s) => ({
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+    }));
+    throw err;
+  } finally {
+    releaseSend();
+  }
+}
+
 function queuedSendOptions(
   message: QueuedMessage,
   batchOrder?: ReadonlyMap<string, number>,
 ): SendOptions {
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
+    ...(message.command ? { command: message.command } : {}),
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
