@@ -15463,6 +15463,10 @@ describe("compact message queue", () => {
       ["pi-native", "completed"],
       ["pi-native", "failed"],
       ["pi-native", "unavailable"],
+      ["codex-native", "completed"],
+      ["codex-native", "failed"],
+      ["opencode-native", "completed"],
+      ["opencode-native", "failed"],
       ["claude-native", "command"],
       ["claude-native", "message-then-command"],
     ] as const)(
@@ -15482,7 +15486,7 @@ describe("compact message queue", () => {
         const [compact] = useChatStore.getState().pendingUserMessages;
         expect(compact?.command).toBe("compact");
         useChatStore.setState({ pendingUserMessages: [ordinary, compact!] });
-        if (harness === "pi-native") {
+        if (harness !== "claude-native") {
           if (outcome === "unavailable") {
             handleSessionEvent({
               type: "error",
@@ -15503,7 +15507,6 @@ describe("compact message queue", () => {
           handleSessionEvent({ type: "compaction_completed", totalTokens: null });
           expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, compact]);
           if (outcome === "message-then-command") {
-            useChatStore.setState({ pendingUserMessages: [compact!, ordinary] });
             handleSessionEvent({
               type: "session_input_consumed",
               itemId: `compact_echo_${queue}`,
@@ -15528,18 +15531,93 @@ describe("compact message queue", () => {
           status: "idle",
         });
         expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary]);
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "ordinary_echo",
+          itemType: "message",
+          data: { role: "user", content: ordinary.content },
+        });
+        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+        expect(
+          useChatStore
+            .getState()
+            .blocks.filter((b) => b.type === "user_message" && b.ctx.itemId === "ordinary_echo"),
+        ).toEqual([
+          expect.objectContaining({ stableKey: ordinary.tempId, content: ordinary.content }),
+        ]);
       },
     );
   });
 
-  it("returns a failed steered compact to the queue and removes its pending bubble", async () => {
-    await useChatStore.getState().compact({ queue: true });
-    const [queued] = useChatStore.getState().queuedMessages;
-    fetchMock.mockRejectedValueOnce(new TypeError("Runner unavailable"));
-    useChatStore.getState().steerMessage(queued!.queueId);
-    await tick();
-    expect(useChatStore.getState().queuedMessages).toEqual([{ ...queued, requiresRetry: true }]);
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    expect(useChatStore.getState().sessionStatus).toBe("running");
-  });
+  it.each(["idle", "completed", "failed"])(
+    "holds the next queued message until compact %s",
+    async (outcome) => {
+      useChatStore.setState({
+        sessionHarness: "claude-native",
+        boundAgentId: "agent_test",
+      });
+      await useChatStore.getState().compact({ queue: true });
+      useChatStore.getState().enqueueMessage("after compact");
+      useChatStore.setState({ sessionStatus: "idle" });
+      useChatStore.getState().maybeFlushQueuedHead();
+      useChatStore.getState().maybeFlushQueuedHead();
+      await tick();
+      expect(eventPosts()).toHaveLength(1);
+      expect(useChatStore.getState().status).toBe("streaming");
+      // Transcript acknowledgement can precede completion; it must not release the queue.
+      handleSessionEvent({
+        type: "slash_command",
+        kind: "command",
+        name: "compact",
+        arguments: "",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "compact-command",
+        responseId: "compact-turn",
+      });
+      useChatStore.getState().maybeFlushQueuedHead();
+      await tick();
+      expect(eventPosts()).toHaveLength(1);
+      expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["after compact"]);
+      handleSessionEvent(
+        outcome === "idle"
+          ? { type: "session_status", conversationId: "conv_compact", status: "idle" }
+          : outcome === "completed"
+            ? { type: "compaction_completed", totalTokens: null }
+            : { type: "compaction_failed" },
+      );
+      useChatStore.getState().maybeFlushQueuedHead();
+      await tick();
+      expect(eventPosts().map(([, init]) => JSON.parse(init!.body as string).type)).toEqual([
+        "compact",
+        "message",
+      ]);
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      expect(useChatStore.getState().compactOwnsSendLatch).toBe(false);
+      // A duplicate/late completion must not release the following ordinary send.
+      handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+      expect(useChatStore.getState().status).toBe("streaming");
+    },
+  );
+
+  it.each(["idle", "running"] as const)(
+    "restores a failed compact without changing the %s turn",
+    async (sessionStatus) => {
+      await useChatStore.getState().compact({ queue: true });
+      const [queued] = useChatStore.getState().queuedMessages;
+      useChatStore.setState({
+        sessionStatus,
+        status: sessionStatus === "running" ? "streaming" : "idle",
+      });
+      fetchMock.mockRejectedValueOnce(new TypeError("Runner unavailable"));
+      useChatStore.getState().steerMessage(queued!.queueId);
+      await tick();
+      expect(useChatStore.getState().queuedMessages).toEqual([{ ...queued, requiresRetry: true }]);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().sessionStatus).toBe(sessionStatus);
+      expect(useChatStore.getState().status).toBe(
+        sessionStatus === "running" ? "streaming" : "idle",
+      );
+    },
+  );
 });

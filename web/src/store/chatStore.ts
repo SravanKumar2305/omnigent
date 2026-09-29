@@ -825,6 +825,8 @@ export interface ConversationState {
    * travel together (adoption on new-chat, eviction, mirroring).
    */
   sendLatchedAt: number | null;
+  /** Whether compaction completion may release the local send latch. */
+  compactOwnsSendLatch: boolean;
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -1811,6 +1813,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   pendingRetryStableId: null,
   sendLatchedAt: null,
+  compactOwnsSendLatch: false,
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
@@ -1956,7 +1959,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // chain started here is safe.
       sendChains.delete(s.conversationId);
       // Clear the latch on THIS conversation's entry only, alongside its status.
-      setActive({ status: "idle", sendLatchedAt: null });
+      setActive({ status: "idle", sendLatchedAt: null, compactOwnsSendLatch: false });
     }
     // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
     // the global array head. The queue is one flat array across conversations,
@@ -2150,6 +2153,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       usesNativeSideChatFork(get().sessionHarness) && isSideChatCommand(text.trim());
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+    } else {
+      pinnedSetter({ compactOwnsSendLatch: false });
     }
     const targetState = pinnedId === null ? get() : setterForState(pinnedId);
     const initialDraft =
@@ -2460,6 +2465,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the just-created session even after the user moved to another chat.
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
+    pinnedSetter({ compactOwnsSendLatch: false });
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming =
@@ -3181,7 +3187,18 @@ async function sendCompact(conversationId: string): Promise<void> {
   const set = setterFor(conversationId);
   const tempId = `pend_${++pendingSeq}`;
   const author = getCurrentAuthorId();
+  const state = setterForState(conversationId);
+  const ownsLatch = state?.status !== "streaming" && state?.sessionStatus !== "running";
+  const latchedAt = Date.now();
   set((s) => ({
+    ...(ownsLatch
+      ? {
+          status: "streaming" as const,
+          activeResponse: null,
+          sendLatchedAt: latchedAt,
+          compactOwnsSendLatch: true,
+        }
+      : {}),
     pendingUserMessages: [
       ...s.pendingUserMessages,
       {
@@ -3204,12 +3221,34 @@ async function sendCompact(conversationId: string): Promise<void> {
     }));
   } catch (err) {
     set((s) => ({
+      ...(ownsLatch && s.sendLatchedAt === latchedAt ? releaseCompactLatch(s) : {}),
       pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
     }));
     throw err;
   } finally {
     releaseSend();
   }
+}
+
+function releaseCompactLatch(s: ChatState): Partial<ChatState> {
+  // A steered compact must not end the turn already running alongside it.
+  if (!s.compactOwnsSendLatch) return {};
+  return {
+    compactOwnsSendLatch: false,
+    ...(s.sessionStatus !== "running" && s.activeResponse?.state !== "streaming"
+      ? { status: "idle" as const, sendLatchedAt: null }
+      : {}),
+  };
+}
+
+function finishCompact(s: ChatState): Partial<ChatState> {
+  return {
+    ...releaseCompactLatch(s),
+    // Claude acknowledges through its transcript; other harnesses only emit status.
+    ...(nativeCodingAgentForHarness(s.sessionHarness)?.harness === "claude-native"
+      ? {}
+      : settlePendingCompact(s)),
+  };
 }
 
 function settlePendingCompact(s: ChatState): Partial<ChatState> {
@@ -6038,6 +6077,14 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   return content;
 }
 
+// Compact echoes acknowledge controls; ordinary transcript text still matches in FIFO order.
+function pendingInputIndex(s: ChatState, content: MessageContentBlock[] | null): number {
+  if (content !== null && isSystemUserContent(content)) return -1;
+  const compact = content !== null && messageContentText(content) === "/compact";
+  const at = s.pendingUserMessages.findIndex((p) => (p.command === "compact") === compact);
+  return at < 0 || s.pendingUserMessages[at]?.initialDraft ? -1 : at;
+}
+
 function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
 }
@@ -6425,7 +6472,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     case "error":
       if (event.error.code === "pi_compact_unavailable") {
-        applyToConversation(settlePendingCompact);
+        applyToConversation(finishCompact);
       }
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
@@ -6532,10 +6579,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // for the next LLM response.completed event.
       applyToConversation((s) => ({
         ...(event.totalTokens != null ? { tokensUsed: event.totalTokens } : {}),
-        // Pi reports compaction status without a transcript command echo.
-        ...(nativeCodingAgentForHarness(s.sessionHarness)?.harness === "pi-native"
-          ? settlePendingCompact(s)
-          : {}),
+        ...finishCompact(s),
       }));
       return;
     case "compaction_failed":
@@ -6547,9 +6591,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const blocks = s.blocks.filter((b) => b.type !== "compaction_loading");
         return {
           ...(blocks.length === s.blocks.length ? {} : { blocks }),
-          ...(nativeCodingAgentForHarness(s.sessionHarness)?.harness === "pi-native"
-            ? settlePendingCompact(s)
-            : {}),
+          ...finishCompact(s),
         };
       });
       return;
@@ -6645,6 +6687,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // `waiting` (set above) and `backgroundTaskCount` is untouched, so the
         // "Working…" spinner and sidebar dot keep reflecting the background work.
         if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
+          patch.compactOwnsSendLatch = false;
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
             if (s.activeResponse.state !== "cancelled") {
@@ -6826,7 +6869,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      message drained (clearedPendingId = the FIFO-oldest entry's
       //      id), so we drop that exact bubble. Covers snapshot-hydrated
       //      bubbles and optimistic ones whose sender adopted the id.
-      //   2. FIFO head — for an optimistic bubble whose POST hasn't
+      //   2. Compact control, or ordinary FIFO head — for a bubble whose POST hasn't
       //      returned the id to adopt yet (consumed raced ahead), or a
       //      cross-client send. Per-session SSE ordering makes the head
       //      the right entry. No text match: the native transcript
@@ -6861,10 +6904,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
-          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
-            return {};
-          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+          const headIndex = pendingInputIndex(s, eventContent);
+          return headIndex < 0
+            ? {}
+            : {
+                pendingUserMessages: s.pendingUserMessages.filter(
+                  (_, index) => index !== headIndex,
+                ),
+              };
         }
 
         // 1. Drop by id when the server names the drained entry.
@@ -6905,16 +6952,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback.
         const eventContent = userContentFromEvent(event);
-        const head =
-          (eventContent !== null && isSystemUserContent(eventContent)) ||
-          s.pendingUserMessages[0]?.initialDraft
-            ? undefined
-            : s.pendingUserMessages[0];
+        const headIndex = pendingInputIndex(s, eventContent);
+        const head = s.pendingUserMessages[headIndex];
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
           return {
-            pendingUserMessages: s.pendingUserMessages.slice(1),
+            pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== headIndex),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
             blocks: [
