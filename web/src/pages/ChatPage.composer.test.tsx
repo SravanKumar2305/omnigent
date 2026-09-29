@@ -3868,7 +3868,9 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    render(<Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />);
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
+    );
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
