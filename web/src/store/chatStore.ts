@@ -2007,6 +2007,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
+      const local = setterForState(conversationId);
+      if (local?.compactOwnsSendLatch) {
+        if (!sendLatchIsStranded(local)) continue;
+        sendChains.delete(conversationId);
+        setterFor(conversationId)({
+          status: "idle",
+          sendLatchedAt: null,
+          compactOwnsSendLatch: false,
+        });
+      }
       // Skip a conversation mid-POST or in its post-failure cooldown so a
       // persistent failure can't spin this into a tight retry loop (the effect
       // re-fires on every re-queue, and a failed POST leaves the row idle).
@@ -2021,43 +2031,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
-      // Join the SAME send chain the foreground path uses for this
-      // conversation. A queued message can hand off from the foreground flush
-      // (send() → its chain) to here the moment the user navigates away, and
-      // the two POST paths would otherwise race — a background postEvent could
-      // overtake a foreground send() still awaiting its chain slot, delivering
-      // out of FIFO order. Taking a slot here (wait before the upload/post,
-      // release in finally) serializes every POST to this conversation across
-      // both paths through one ordering primitive.
-      const { waitForPrior, releaseSend } = enterSendChain(conversationId);
-      // Upload any attachments, then post the message referencing their
-      // server-assigned file_ids — the same two-phase sequence send() runs
-      // (no combined endpoint exists: /resources/files stores the blob and
-      // returns an id, /events posts a message that points at that id). Both
-      // awaits sit under the one in-flight guard and the one catch, so a
-      // failure in either phase re-queues and backs off together.
-      //
-      // No optimistic bubble — we're not viewing this conversation; it
-      // re-hydrates from the snapshot on return. On failure re-queue at the
-      // head (preserving this conversation's FIFO order) and set a cooldown so
-      // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
-        await waitForPrior();
         if (head.command) {
-          await postEvent(conversationId, { type: head.command, data: {} });
+          await sendCompact(conversationId, true);
           return;
         }
-        // Reuse prior successful uploads so cooldown-paced retries do not
-        // orphan blobs that already landed.
-        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
-        const content: ContentBlock[] = [
-          ...fileBlocks,
-          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
-        ];
-        await postEvent(conversationId, {
-          type: "message",
-          data: { role: "user", content, stable_id: head.stableId },
-        });
+        // Foreground and background POSTs share submission ordering.
+        const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+        try {
+          await waitForPrior();
+          const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
+          const content: ContentBlock[] = [
+            ...fileBlocks,
+            ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+          ];
+          await postEvent(conversationId, {
+            type: "message",
+            data: { role: "user", content, stable_id: head.stableId },
+          });
+        } finally {
+          releaseSend();
+        }
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -2078,9 +2072,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
-          // Hand the chain to the next POST (foreground or background) so it
-          // can start its own network work in submission order.
-          releaseSend();
+          // Completion may have arrived before the compact POST returned.
+          if (head.command) get().flushBackgroundQueues();
         });
     }
   },
@@ -2621,6 +2614,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const patch: Partial<ChatState> = {
         pendingUserMessages: [],
         status: "idle",
+        compactOwnsSendLatch: false,
         sessionStatus: "idle",
         backgroundTaskCount: 0,
         backgroundTasks: [],
@@ -3183,18 +3177,20 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 // ── Internal helpers ─────────────────────────────────────
 
 /** Show a pending control until its harness acknowledges it. */
-async function sendCompact(conversationId: string): Promise<void> {
-  const set = setterFor(conversationId);
+async function sendCompact(conversationId: string, ensureStream = false): Promise<void> {
+  const entry = conversationRegistry.acquire(conversationId);
+  const set = entrySetter(entry);
   const tempId = `pend_${++pendingSeq}`;
   const author = getCurrentAuthorId();
   const state = setterForState(conversationId);
-  const ownsLatch = state?.status !== "streaming" && state?.sessionStatus !== "running";
-  const latchedAt = Date.now();
+  const alreadyRunning = state?.status === "streaming" || state?.sessionStatus === "running";
+  const ownsLatch = ensureStream || !alreadyRunning;
+  let latchedAt = Date.now();
   set((s) => ({
     ...(ownsLatch
       ? {
           status: "streaming" as const,
-          activeResponse: null,
+          activeResponse: alreadyRunning ? s.activeResponse : null,
           sendLatchedAt: latchedAt,
           compactOwnsSendLatch: true,
         }
@@ -3213,6 +3209,20 @@ async function sendCompact(conversationId: string): Promise<void> {
   const { waitForPrior, releaseSend } = enterSendChain(conversationId);
   try {
     await waitForPrior();
+    // A background queue can outlive its cached conversation/stream.
+    if (ensureStream && !isConversationStreamCurrent(conversationId)) {
+      abortConversationStream(entry);
+      set({ conversationLoadError: null });
+      await bindStream(conversationId, set, entryGetter(entry));
+      if (entry.disposed) throw new Error("Session closed before compaction could be sent.");
+      const loadError = entry.getState().conversationLoadError;
+      if (loadError !== null) throw loadError;
+    }
+    if (ensureStream) {
+      // Binding can replay an idle edge before this control has been submitted.
+      latchedAt = Date.now();
+      set({ status: "streaming", sendLatchedAt: latchedAt, compactOwnsSendLatch: true });
+    }
     await postEvent(conversationId, { type: "compact", data: {} });
     set((s) => ({
       pendingUserMessages: s.pendingUserMessages.map((p) =>
@@ -6077,10 +6087,15 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   return content;
 }
 
-// Compact echoes acknowledge controls; ordinary transcript text still matches in FIFO order.
-function pendingInputIndex(s: ChatState, content: MessageContentBlock[] | null): number {
-  if (content !== null && isSystemUserContent(content)) return -1;
+// The server can attach an ordinary FIFO pending id to a compact control's echo.
+function pendingInputIndex(s: ChatState, event: SessionInputConsumedEvent): number {
+  const content = userContentFromEvent(event);
   const compact = content !== null && messageContentText(content) === "/compact";
+  const named = s.pendingUserMessages.findIndex(
+    (p) => p.tempId === event.clearedPendingId && (p.command === "compact") === compact,
+  );
+  if (named >= 0) return named;
+  if (content !== null && isSystemUserContent(content)) return -1;
   const at = s.pendingUserMessages.findIndex((p) => (p.command === "compact") === compact);
   return at < 0 || s.pendingUserMessages[at]?.initialDraft ? -1 : at;
 }
@@ -6473,6 +6488,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     case "error":
       if (event.error.code === "pi_compact_unavailable") {
         applyToConversation(finishCompact);
+        useChatStore.getState().flushBackgroundQueues();
       }
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
@@ -6581,6 +6597,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         ...(event.totalTokens != null ? { tokensUsed: event.totalTokens } : {}),
         ...finishCompact(s),
       }));
+      useChatStore.getState().flushBackgroundQueues();
       return;
     case "compaction_failed":
       // Compaction failed — history is unchanged. Remove every
@@ -6594,6 +6611,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           ...finishCompact(s),
         };
       });
+      useChatStore.getState().flushBackgroundQueues();
       return;
     case "policy_denied":
       // Policy denied the user input — drop the optimistic bubble (the
@@ -6863,124 +6881,29 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
-      // Promote the matching optimistic bubble into committed history.
-      // Three ways to find it, in order of precision:
-      //   1. By id — the server tells us which pending-input entry this
-      //      message drained (clearedPendingId = the FIFO-oldest entry's
-      //      id), so we drop that exact bubble. Covers snapshot-hydrated
-      //      bubbles and optimistic ones whose sender adopted the id.
-      //   2. Compact control, or ordinary FIFO head — for a bubble whose POST hasn't
-      //      returned the id to adopt yet (consumed raced ahead), or a
-      //      cross-client send. Per-session SSE ordering makes the head
-      //      the right entry. No text match: the native transcript
-      //      reformats text (reply-quote `>` blockquotes, `[Attached:]`
-      //      markers), so a text guard would wrongly skip the drop and
-      //      strand the bubble as a duplicate. Only system markers, which
-      //      never had a bubble here, are held back.
-      //   3. No pending entry — render the event payload as a fresh
-      //      committed bubble (TUI-typed message, marker, or another
-      //      client).
+      // Compact echoes match controls before considering server pending ids.
+      // Ordinary echoes use their named entry, then FIFO without comparing text.
       applyToConversation((s) => {
-        if (hasCommittedItem(s.blocks, event.itemId)) {
-          // The committed copy is already in `blocks` — the forwarder-mirrored
-          // item beat this event through the stream, or a snapshot merge
-          // inserted it. Still ack the optimistic bubble: returning without
-          // dropping it strands a duplicate user bubble at the transcript tail.
-          // Same precision order as below (named entry, then FIFO head), minus
-          // the append.
-          const cleared = event.clearedPendingId;
-          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
-          if (at >= 0) {
-            return {
-              pendingUserMessages: [
-                ...s.pendingUserMessages.slice(0, at),
-                ...s.pendingUserMessages.slice(at + 1),
-              ],
-            };
-          }
-          // FIFO-head fallback — same marker guard as the promote path below. A
-          // mirrored system marker (the vendor CLI's own `[Request interrupted
-          // by user]` record) is synthesized by the CLI, owns no pending entry,
-          // and arrives with clearedPendingId unset; dropping the head would
-          // steal a real queued message's bubble. Hold the head back for a marker.
-          const eventContent = userContentFromEvent(event);
-          const headIndex = pendingInputIndex(s, eventContent);
-          return headIndex < 0
-            ? {}
-            : {
-                pendingUserMessages: s.pendingUserMessages.filter(
-                  (_, index) => index !== headIndex,
-                ),
-              };
-        }
-
-        // 1. Drop by id when the server names the drained entry.
-        const cleared = event.clearedPendingId;
-        if (cleared) {
-          const idx = s.pendingUserMessages.findIndex((p) => p.tempId === cleared);
-          if (idx >= 0) {
-            const matched = s.pendingUserMessages[idx]!;
-            const content = committedContentFor(event, matched.content);
-            if (content === null) return {};
-            return {
-              pendingUserMessages: [
-                ...s.pendingUserMessages.slice(0, idx),
-                ...s.pendingUserMessages.slice(idx + 1),
-              ],
-              // stableKey = the optimistic bubble's temp id → the
-              // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
-                committedUserBlock(
-                  event.itemId,
-                  content,
-                  matched.tempId,
-                  event.createdBy ?? matched.author,
-                  matched.createdAtS,
-                ),
-              ],
-            };
-          }
-        }
-
-        // 2. FIFO head fallback (id not adopted yet / cross-client).
-        //    Skipped for an unsent draft or a mirrored system marker (the vendor CLI's own
-        //    interrupt record): it is synthesized by the CLI, never queued
-        //    here, so popping the head would hand the queued message's
-        //    uploads to the marker and leave the real message empty. A
-        //    `[System: …]` notice DOES have a pending entry, but the server
-        //    drains it and names it via `clearedPendingId`, so it lands on
-        //    branch 1 and never reaches this fallback.
-        const eventContent = userContentFromEvent(event);
-        const headIndex = pendingInputIndex(s, eventContent);
-        const head = s.pendingUserMessages[headIndex];
-        if (head) {
-          const content = committedContentFor(event, head.content);
-          if (content === null) return {};
-          return {
-            pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== headIndex),
-            // stableKey = the popped optimistic bubble's temp id so the
-            // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
-              committedUserBlock(
-                event.itemId,
-                content,
-                head.tempId,
-                event.createdBy ?? head.author,
-                head.createdAtS,
-              ),
-            ],
-          };
-        }
-
-        // 3. Nothing pending (or a marker that owns no bubble) — render the
-        //    event payload fresh.
-        if (eventContent === null) return {};
+        const at = pendingInputIndex(s, event);
+        const pending = s.pendingUserMessages[at];
+        const acknowledged = pending
+          ? { pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== at) }
+          : {};
+        // A snapshot or mirrored item can precede the acknowledgement.
+        if (hasCommittedItem(s.blocks, event.itemId)) return acknowledged;
+        const content = committedContentFor(event, pending?.content ?? null);
+        if (content === null) return {};
         return {
+          ...acknowledged,
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              content,
+              pending?.tempId,
+              event.createdBy ?? pending?.author,
+              pending?.createdAtS,
+            ),
           ],
         };
       });
