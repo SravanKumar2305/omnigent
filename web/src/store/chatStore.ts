@@ -146,7 +146,10 @@ import {
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
@@ -508,6 +511,8 @@ export function removeLocalConversation(tempConvId: string): boolean {
  * real id comes from the consumed event when we promote into `blocks`.
  */
 export interface PendingUserMessage {
+  /** Control acknowledgement must not consume an unrelated pending message. */
+  command?: "compact";
   tempId: string;
   content: MessageContentBlock[];
   /** Unsent draft awaiting session/model readiness, including unuploaded files. */
@@ -3171,7 +3176,7 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
-/** Use the normal pending bubble; native transcript events reconcile it. */
+/** Show a pending control until its harness acknowledges it. */
 async function sendCompact(conversationId: string): Promise<void> {
   const set = setterFor(conversationId);
   const tempId = `pend_${++pendingSeq}`;
@@ -3181,6 +3186,7 @@ async function sendCompact(conversationId: string): Promise<void> {
       ...s.pendingUserMessages,
       {
         tempId,
+        command: "compact",
         content: [{ type: "input_text", text: "/compact" }],
         createdAtS: Math.floor(Date.now() / 1000),
         ...(author !== null ? { author } : {}),
@@ -3204,6 +3210,13 @@ async function sendCompact(conversationId: string): Promise<void> {
   } finally {
     releaseSend();
   }
+}
+
+function settlePendingCompact(s: ChatState): Partial<ChatState> {
+  const at = s.pendingUserMessages.findIndex((p) => p.command === "compact");
+  return at < 0
+    ? {}
+    : { pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== at) };
 }
 
 function queuedSendOptions(
@@ -6411,6 +6424,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "error":
+      if (event.error.code === "pi_compact_unavailable") {
+        applyToConversation(settlePendingCompact);
+      }
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
       // already shows the true model). The error block itself renders
@@ -6514,9 +6530,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Update the context-ring immediately with the post-compaction token
       // estimate so the ring reflects the reduced context without waiting
       // for the next LLM response.completed event.
-      if (event.totalTokens != null) {
-        applyToConversation({ tokensUsed: event.totalTokens });
-      }
+      applyToConversation((s) => ({
+        ...(event.totalTokens != null ? { tokensUsed: event.totalTokens } : {}),
+        // Pi reports compaction status without a transcript command echo.
+        ...(nativeCodingAgentForHarness(s.sessionHarness)?.harness === "pi-native"
+          ? settlePendingCompact(s)
+          : {}),
+      }));
       return;
     case "compaction_failed":
       // Compaction failed — history is unchanged. Remove every
@@ -6525,7 +6545,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // so more than one loading block may be present.
       applyToConversation((s) => {
         const blocks = s.blocks.filter((b) => b.type !== "compaction_loading");
-        return blocks.length === s.blocks.length ? {} : { blocks };
+        return {
+          ...(blocks.length === s.blocks.length ? {} : { blocks }),
+          ...(nativeCodingAgentForHarness(s.sessionHarness)?.harness === "pi-native"
+            ? settlePendingCompact(s)
+            : {}),
+        };
       });
       return;
     case "policy_denied":
@@ -6917,20 +6942,16 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "slash_command":
-      // Claude-native: a `/skill-name` or surfaced CLI command typed
-      // in the web composer round-trips through tmux → Claude TUI →
-      // transcript → `external_conversation_item` (type=slash_command)
-      // → `response.output_item.done`. The Omnigent server bypasses
-      // persistence for these (no `session.input.consumed` fires),
-      // so the optimistic bubble in `pendingUserMessages` would
-      // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; observing clients and drafts still held locally cannot
-      // acknowledge a send, so they just render the block.
+      if (event.kind === "command" && event.name === "compact") {
+        // A raw message echo may already have acknowledged this compact.
+        applyToConversation(settlePendingCompact);
+        return;
+      }
+      // Other native slash commands acknowledge the oldest ordinary send.
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
-        const [, ...rest] = s.pendingUserMessages;
-        return { pendingUserMessages: rest };
+        const at = s.pendingUserMessages.findIndex((p) => p.command !== "compact");
+        if (at < 0 || s.pendingUserMessages[at]?.initialDraft) return {};
+        return { pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== at) };
       });
       return;
     case "session_interrupted":

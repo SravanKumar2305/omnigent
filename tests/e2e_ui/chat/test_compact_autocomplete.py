@@ -59,19 +59,22 @@ def test_tab_completes_compact_until_explicit_submit(
 
     _publish_status(base_url, session_id, "running", response_id="active-turn")
     expect(page.get_by_role("button", name="Interrupt", exact=True)).to_be_visible()
-    # The existing native transcript echo replaces the pending bubble.
+    # Claude can emit a command record with or without a raw message echo.
+    command_only = mode in ("idle", "drain")
+    item_data = (
+        {"agent": "claude-native-ui", "kind": "command", "name": "compact", "arguments": ""}
+        if command_only
+        else {"role": "user", "content": [{"type": "input_text", "text": "/compact"}]}
+    )
     response = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={
             "type": "external_conversation_item",
             "data": {
-                "item_type": "message",
+                "item_type": "slash_command" if command_only else "message",
                 "response_id": "compact-turn",
                 "source_id": "native-compact",
-                "item_data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "/compact"}],
-                },
+                "item_data": item_data,
             },
         },
         timeout=10,
@@ -80,8 +83,9 @@ def test_tab_completes_compact_until_explicit_submit(
     # A later status event confirms that the echo reached the browser.
     _publish_status(base_url, session_id, "idle")
     expect(page.get_by_role("button", name="Interrupt", exact=True)).not_to_be_visible()
-    expect(bubble).to_have_count(1)
+    expect(bubble).to_have_count(0 if command_only else 1)
+    expect(page.get_by_test_id("slash-command-card")).to_have_count(1 if command_only else 0)
     page.reload()
-    expect(bubble).to_have_count(1)
-    expect(bubble).to_be_visible()
+    expect(bubble).to_have_count(0 if command_only else 1)
+    expect(page.get_by_test_id("slash-command-card")).to_have_count(1 if command_only else 0)
     page.unroute_all(behavior="wait")

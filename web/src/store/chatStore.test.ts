@@ -15458,6 +15458,80 @@ describe("compact message queue", () => {
     },
   );
 
+  describe.each([false, true])("compact acknowledgement with queue=%s", (queue) => {
+    it.each([
+      ["pi-native", "completed"],
+      ["pi-native", "failed"],
+      ["pi-native", "unavailable"],
+      ["claude-native", "command"],
+      ["claude-native", "message-then-command"],
+    ] as const)(
+      "settles %s compact via %s without consuming other sends",
+      async (harness, outcome) => {
+        const ordinary: PendingUserMessage = {
+          tempId: "ordinary",
+          content: [{ type: "input_text", text: "keep working" }],
+        };
+        useChatStore.setState({ sessionHarness: harness, pendingUserMessages: [] });
+        await useChatStore.getState().compact({ queue });
+        if (queue) {
+          useChatStore.setState({ sessionStatus: "idle" });
+          useChatStore.getState().maybeFlushQueuedHead();
+          await tick();
+        }
+        const [compact] = useChatStore.getState().pendingUserMessages;
+        expect(compact?.command).toBe("compact");
+        useChatStore.setState({ pendingUserMessages: [ordinary, compact!] });
+        if (harness === "pi-native") {
+          if (outcome === "unavailable") {
+            handleSessionEvent({
+              type: "error",
+              source: "execution",
+              toolName: null,
+              error: { code: "pi_compact_unavailable", message: "Compaction unavailable" },
+            });
+          } else {
+            handleSessionEvent({ type: "compaction_in_progress" });
+            expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, compact]);
+            handleSessionEvent(
+              outcome === "completed"
+                ? { type: "compaction_completed", totalTokens: 123 }
+                : { type: "compaction_failed" },
+            );
+          }
+        } else {
+          handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+          expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, compact]);
+          if (outcome === "message-then-command") {
+            useChatStore.setState({ pendingUserMessages: [compact!, ordinary] });
+            handleSessionEvent({
+              type: "session_input_consumed",
+              itemId: `compact_echo_${queue}`,
+              itemType: "message",
+              data: { role: "user", content: [{ type: "input_text", text: "/compact" }] },
+            });
+          }
+          handleSessionEvent({
+            type: "slash_command",
+            kind: "command",
+            name: "compact",
+            arguments: "",
+            output: null,
+            agentName: "claude-native-ui",
+            itemId: "compact-command",
+            responseId: "compact-turn",
+          });
+        }
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_compact",
+          status: "idle",
+        });
+        expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary]);
+      },
+    );
+  });
+
   it("returns a failed steered compact to the queue and removes its pending bubble", async () => {
     await useChatStore.getState().compact({ queue: true });
     const [queued] = useChatStore.getState().queuedMessages;
