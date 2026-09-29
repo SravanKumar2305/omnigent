@@ -16,7 +16,12 @@ import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
+import {
+  handleSessionEvent,
+  useChatStore,
+  type ChatState,
+  type QueuedMessage,
+} from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -3858,6 +3863,39 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
     expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("does not clear a new identical draft after submitting an edited restored send", async () => {
+    const stableId = "f".repeat(32);
+    // Submit through the store: the queued path is what a mid-turn Enter takes.
+    render(<Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
+      }),
+    );
+    expect(textarea()).toHaveValue("continue");
+
+    fireEvent.change(textarea(), { target: { value: "continue, but edited" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+
+    // A NEW draft that merely repeats the old text...
+    fireEvent.change(textarea(), { target: { value: "continue" } });
+    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe("continue"));
+    // ...must survive the old send's delivery evidence arriving late.
+    act(() =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "continue" }] },
+      }),
+    );
+    expect(textarea()).toHaveValue("continue");
+    expect(getSessionDraft("conv_test")?.text).toBe("continue");
   });
 
   it.each([false, true])(

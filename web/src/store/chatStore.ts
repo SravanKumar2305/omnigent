@@ -1844,6 +1844,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
     setActive((s) => ({
+      // Queueing consumes the composer like a send does: a restored failed
+      // send is no longer what the composer holds, and the queued message
+      // carries its own id, so neither the tracker nor the retry id may
+      // outlive this submission.
+      pendingRetryStableId: null,
+      restoredSendDraft: null,
       queuedMessages: [
         ...s.queuedMessages,
         {
@@ -2110,7 +2116,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
     const retryId = pinnedState?.pendingRetryStableId ?? null;
-    if (retryId !== null) pinnedSetter({ pendingRetryStableId: null });
+    // Submitting consumes what the composer held, a restored failed send
+    // included: drop its tracker too, or delivery evidence for that send could
+    // later retract a NEW draft that merely repeats the same text.
+    if (retryId !== null || (pinnedState?.restoredSendDraft ?? null) !== null) {
+      pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
+    }
     // A restored failed send keeps its stable id only when resent untouched:
     // the server persists a web send under that id and dedupes a repeat, so an
     // edited body under the old id would run without ever being persisted.
