@@ -146,10 +146,15 @@ import {
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
+  /** Dispatch a queued control instead of a text message. */
+  command?: "compact";
   /** Client-only quote provenance, retained if the composer needs to retry. */
   replyDraft?: StoredReplyDraft;
   /**
@@ -506,6 +511,10 @@ export function removeLocalConversation(tempConvId: string): boolean {
  * real id comes from the consumed event when we promote into `blocks`.
  */
 export interface PendingUserMessage {
+  /** Control acknowledgement must not consume an unrelated pending message. */
+  command?: "compact";
+  /** Earliest recovery time if a posted compact never receives its transcript ack. */
+  compactAckDeadline?: number;
   tempId: string;
   content: MessageContentBlock[];
   /** Unsent draft awaiting session/model readiness, including unuploaded files. */
@@ -542,6 +551,7 @@ export interface PendingUserMessage {
  * directly (no serialization concern).
  */
 export interface QueuedMessage {
+  command?: "compact";
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
@@ -817,6 +827,8 @@ export interface ConversationState {
    * travel together (adoption on new-chat, eviction, mirroring).
    */
   sendLatchedAt: number | null;
+  /** Released compaction still waits for in-flight steers to accept or reject. */
+  compactSendLatch: "owned" | "released" | null;
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -1053,7 +1065,7 @@ export interface AppChatState {
 
 /** Actions exposed on the root store. */
 export interface ChatActions {
-  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  send: (text: string, agentId: string | null, files?: File[], opts?: SendOptions) => Promise<void>;
   clearSideChatToOpen: () => void;
   /** Open a generic side chat as a rail tab under `parentId`, seeding its
    *  composer with `draft` (the typed `/side` question) so it isn't lost while
@@ -1066,7 +1078,12 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  enqueueMessage: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    command?: "compact",
+  ) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1222,11 +1239,10 @@ export interface ChatActions {
    *  successful `launchRunner` for the open session. */
   markRunnerLaunched: () => void;
   /**
-   * Compact the active session's context. Posts a ``compact`` event to the
-   * server, which summarises the conversation history in-place. No-ops when
-   * there is no active conversation.
+   * Queue or dispatch a ``compact`` control with the normal pending user bubble.
+   * No-ops when there is no active conversation.
    */
-  compact: () => Promise<void>;
+  compact: (opts?: { queue?: boolean }) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -1647,8 +1663,8 @@ export function initChatStore(client: QueryClient): void {
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
-  // Drop this tab's held stream slots; disposed pumps release their own locks,
-  // and a boot/reset starts from an empty set.
+  // Reset releases slots before their disposed pumps finish winding down.
+  for (const owner of heldStreamSlots.values()) void owner.slot.release();
   heldStreamSlots.clear();
   // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
@@ -1799,6 +1815,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   pendingRetryStableId: null,
   sendLatchedAt: null,
+  compactSendLatch: null,
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
@@ -1822,7 +1839,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files, replyDraft) => {
+  enqueueMessage: (text, files, replyDraft, command) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1834,6 +1851,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         {
           queueId,
           text,
+          ...(command ? { command } : {}),
           stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1887,7 +1905,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
-    if (target === undefined || agentId === null) return;
+    if (target === undefined || (agentId === null && !target.command)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
@@ -1896,7 +1914,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   steerAllQueuedMessages: (conversationId) => {
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-    if (own.length === 0 || own.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
+    if (own.length === 0 || own.some((m) => !m.command && (m.agentId ?? s.boundAgentId) === null))
+      return;
     const batchOrder = new Map(own.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
     setActive({
@@ -1904,7 +1923,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
     for (const m of own) {
       const agentId = m.agentId ?? s.boundAgentId;
-      if (agentId === null) continue;
       void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
     }
   },
@@ -1924,8 +1942,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the turn already ended and only background work (background shells /
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
-    // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
+    // an actively `running` turn gate the flush. Controls need no agent binding.
+    if (s.conversationId === null || s.sessionStatus === "running") {
       return;
     }
     if (s.status === "streaming") {
@@ -1943,7 +1961,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // chain started here is safe.
       sendChains.delete(s.conversationId);
       // Clear the latch on THIS conversation's entry only, alongside its status.
-      setActive({ status: "idle", sendLatchedAt: null });
+      setActive((st) => ({
+        status: "idle",
+        sendLatchedAt: null,
+        compactSendLatch: null,
+        ...(st.compactSendLatch === "owned" ? settlePendingCompact(st) : {}),
+      }));
     }
     // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
     // the global array head. The queue is one flat array across conversations,
@@ -1951,6 +1974,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
     if (head === undefined || head.requiresRetry) return;
+    if (!head.command && (head.agentId ?? s.boundAgentId) === null) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -1990,6 +2014,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
+      const local = setterForState(conversationId);
+      if (local?.compactSendLatch === "owned") {
+        if (!sendLatchIsStranded(local)) continue;
+        sendChains.delete(conversationId);
+        setterFor(conversationId)((st) => ({
+          status: "idle",
+          sendLatchedAt: null,
+          compactSendLatch: null,
+          ...settlePendingCompact(st),
+        }));
+      }
       // Skip a conversation mid-POST or in its post-failure cooldown so a
       // persistent failure can't spin this into a tight retry loop (the effect
       // re-fires on every re-queue, and a failed POST leaves the row idle).
@@ -2004,39 +2039,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
-      // Join the SAME send chain the foreground path uses for this
-      // conversation. A queued message can hand off from the foreground flush
-      // (send() → its chain) to here the moment the user navigates away, and
-      // the two POST paths would otherwise race — a background postEvent could
-      // overtake a foreground send() still awaiting its chain slot, delivering
-      // out of FIFO order. Taking a slot here (wait before the upload/post,
-      // release in finally) serializes every POST to this conversation across
-      // both paths through one ordering primitive.
-      const { waitForPrior, releaseSend } = enterSendChain(conversationId);
-      // Upload any attachments, then post the message referencing their
-      // server-assigned file_ids — the same two-phase sequence send() runs
-      // (no combined endpoint exists: /resources/files stores the blob and
-      // returns an id, /events posts a message that points at that id). Both
-      // awaits sit under the one in-flight guard and the one catch, so a
-      // failure in either phase re-queues and backs off together.
-      //
-      // No optimistic bubble — we're not viewing this conversation; it
-      // re-hydrates from the snapshot on return. On failure re-queue at the
-      // head (preserving this conversation's FIFO order) and set a cooldown so
-      // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
-        await waitForPrior();
-        // Reuse prior successful uploads so cooldown-paced retries do not
-        // orphan blobs that already landed.
-        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
-        const content: ContentBlock[] = [
-          ...fileBlocks,
-          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
-        ];
-        await postEvent(conversationId, {
-          type: "message",
-          data: { role: "user", content, stable_id: head.stableId },
-        });
+        if (head.command) {
+          await sendCompact(conversationId, true);
+          return;
+        }
+        // Foreground and background POSTs share submission ordering.
+        const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+        try {
+          await waitForPrior();
+          const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
+          const content: ContentBlock[] = [
+            ...fileBlocks,
+            ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+          ];
+          await postEvent(conversationId, {
+            type: "message",
+            data: { role: "user", content, stable_id: head.stableId },
+          });
+        } finally {
+          releaseSend();
+        }
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -2057,9 +2080,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
-          // Hand the chain to the next POST (foreground or background) so it
-          // can start its own network work in submission order.
-          releaseSend();
+          // Completion may have arrived before the compact POST returned.
+          if (head.command) get().flushBackgroundQueues();
         });
     }
   },
@@ -2084,6 +2106,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
   },
   send: async (text, agentId, files, opts) => {
+    if (opts?.command === "compact") {
+      const id = opts.pinnedConversationId ?? get().conversationId;
+      if (!id) return;
+      try {
+        await sendCompact(id);
+      } catch (err) {
+        if (!opts.onError) throw err;
+        opts.onError(describeSendFailure(err).message);
+      }
+      return;
+    }
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
@@ -2295,9 +2328,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // away while the POST was open, and settling the VISIBLE conversation
         // would clobber an unrelated chat's composer state.
         setterFor(sessionId)((s) => {
-          const patch: Partial<ChatState> = {
-            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-          };
+          const patch = rollbackPendingSend(s, tempId);
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
@@ -2314,6 +2345,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
+          ...(s.pendingUserMessages.some((p) => p.tempId === tempId)
+            ? { compactSendLatch: null }
+            : {}),
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, posted: true } : p,
           ),
@@ -2383,9 +2417,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
       // Roll back the optimistic bubble — no server idle will fire.
-      failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-      }));
+      failSet((s) => rollbackPendingSend(s, tempId));
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
@@ -2493,9 +2525,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // conversation must still roll its echo back, and settling the VISIBLE
         // one would clobber an unrelated chat.
         setterFor(sessionId)((s) => {
-          const patch: Partial<ChatState> = {
-            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-          };
+          const patch = rollbackPendingSend(s, tempId);
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
@@ -2512,6 +2542,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // SlashCommandBlock, not a user message, so the navigate-back
         // text dedupe can never match it, and no consumed event fires.
         setterFor(sessionId)((s) => ({
+          ...(s.pendingUserMessages.some((p) => p.tempId === tempId)
+            ? { compactSendLatch: null }
+            : {}),
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, posted: true } : p,
           ),
@@ -2529,9 +2562,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failTarget = postedSessionId ?? submitConversationId;
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       // Roll back the optimistic echo — no receipt will reconcile it.
-      failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-      }));
+      failSet((s) => rollbackPendingSend(s, tempId));
       if (!alreadyStreaming) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
@@ -2586,6 +2617,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const patch: Partial<ChatState> = {
         pendingUserMessages: [],
         status: "idle",
+        compactSendLatch: null,
         sessionStatus: "idle",
         backgroundTaskCount: 0,
         backgroundTasks: [],
@@ -2836,10 +2868,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
-  compact: async () => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    await postEvent(conversationId, { type: "compact", data: {} });
+  compact: async (opts) => {
+    const s = get();
+    if (!s.conversationId) return;
+    if (opts?.queue) {
+      s.enqueueMessage("/compact", undefined, undefined, "compact");
+      return;
+    }
+    await sendCompact(s.conversationId);
   },
 
   refreshSessionState: async (conversationId) => {
@@ -3143,12 +3179,138 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
+/** Show a pending control until its harness acknowledges it. */
+async function sendCompact(conversationId: string, ensureStream = false): Promise<void> {
+  const entry = conversationRegistry.acquire(conversationId);
+  const set = entrySetter(entry);
+  const tempId = `pend_${++pendingSeq}`;
+  const author = getCurrentAuthorId();
+  const state = setterForState(conversationId);
+  const alreadyRunning = state?.status === "streaming" || state?.sessionStatus === "running";
+  const ownsLatch = ensureStream || !alreadyRunning;
+  let latchedAt = Date.now();
+  set((s) => ({
+    ...(ownsLatch
+      ? {
+          status: "streaming" as const,
+          activeResponse: alreadyRunning ? s.activeResponse : null,
+          sendLatchedAt: latchedAt,
+          compactSendLatch: "owned" as const,
+        }
+      : {}),
+    pendingUserMessages: [
+      ...s.pendingUserMessages,
+      {
+        tempId,
+        command: "compact",
+        content: [{ type: "input_text", text: "/compact" }],
+        createdAtS: Math.floor(Date.now() / 1000),
+        ...(author !== null ? { author } : {}),
+      },
+    ],
+  }));
+  const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+  try {
+    await waitForPrior();
+    if (entry.disposed) throw new Error("Session closed before compaction could be sent.");
+    // A background queue can outlive its cached conversation/stream.
+    if (ensureStream && !isConversationStreamCurrent(conversationId)) {
+      abortConversationStream(entry);
+      set({ conversationLoadError: null });
+      await bindStream(conversationId, entrySetter(entry), entryGetter(entry));
+      if (entry.disposed) throw new Error("Session closed before compaction could be sent.");
+      const loadError = entry.getState().conversationLoadError;
+      if (loadError !== null) throw loadError;
+    }
+    if (ensureStream) {
+      // Binding can replay an idle edge before this control has been submitted.
+      latchedAt = Date.now();
+      set({ status: "streaming", sendLatchedAt: latchedAt, compactSendLatch: "owned" });
+    }
+    await postEvent(conversationId, { type: "compact", data: {} });
+    setterFor(conversationId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.map((p) =>
+        p.tempId === tempId
+          ? { ...p, posted: true, compactAckDeadline: Date.now() + SEND_CHAIN_MAX_WAIT_MS }
+          : p,
+      ),
+    }));
+  } catch (err) {
+    setterFor(conversationId)((s) => ({
+      ...(ownsLatch && s.sendLatchedAt === latchedAt ? releaseCompactLatch(s) : {}),
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+    }));
+    throw err;
+  } finally {
+    releaseSend();
+  }
+}
+
+function releaseCompactLatch(s: ChatState): Partial<ChatState> {
+  // A steered compact must not end the turn already running alongside it.
+  if (s.compactSendLatch !== "owned") return {};
+  return {
+    compactSendLatch: "released",
+    ...idleAfterCompact(s),
+  };
+}
+
+function idleAfterCompact(s: ChatState, pending = s.pendingUserMessages): Partial<ChatState> {
+  // A steered send owns the busy state until accepted work finishes or it rejects.
+  return s.sessionStatus !== "running" &&
+    s.activeResponse?.state !== "streaming" &&
+    !pending.some((p) => p.command !== "compact")
+    ? { status: "idle", sendLatchedAt: null, compactSendLatch: null }
+    : {};
+}
+
+function rollbackPendingSend(s: ChatState, tempId: string): Partial<ChatState> {
+  const pendingUserMessages = s.pendingUserMessages.filter((p) => p.tempId !== tempId);
+  return {
+    pendingUserMessages,
+    ...(s.compactSendLatch === "released" ? idleAfterCompact(s, pendingUserMessages) : {}),
+  };
+}
+
+function finishCompact(s: ChatState): Partial<ChatState> {
+  return {
+    ...releaseCompactLatch(s),
+    // Claude acknowledges through its transcript; other harnesses only emit status.
+    ...(nativeCodingAgentForHarness(s.sessionHarness)?.harness === "claude-native"
+      ? {}
+      : settlePendingCompact(s)),
+  };
+}
+
+function expireCompactAcknowledgements(s: ChatState): Partial<ChatState> {
+  if (
+    s.compactSendLatch === "owned" ||
+    s.sessionStatus === "running" ||
+    s.activeResponse?.state === "streaming"
+  )
+    return {};
+  const now = Date.now();
+  const pendingUserMessages = s.pendingUserMessages.filter(
+    (p) =>
+      p.command !== "compact" || p.compactAckDeadline === undefined || p.compactAckDeadline > now,
+  );
+  return pendingUserMessages.length === s.pendingUserMessages.length ? {} : { pendingUserMessages };
+}
+
+function settlePendingCompact(s: ChatState): Partial<ChatState> {
+  const at = s.pendingUserMessages.findIndex((p) => p.command === "compact");
+  return at < 0
+    ? {}
+    : { pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== at) };
+}
+
 function queuedSendOptions(
   message: QueuedMessage,
   batchOrder?: ReadonlyMap<string, number>,
 ): SendOptions {
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
+    ...(message.command ? { command: message.command } : {}),
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
@@ -3190,7 +3352,10 @@ const rootSetState = useChatStore.setState;
 //
 // One held slot == one live stream this tab is counted for against the shared,
 // cross-tab cap (see `streamSlots`). Keyed by conversation id.
-const heldStreamSlots = new Map<string, StreamSlot>();
+interface StreamSlotOwner {
+  slot: StreamSlot;
+}
+const heldStreamSlots = new Map<string, StreamSlotOwner>();
 
 /**
  * Take an origin-wide stream slot for `id` before opening its stream.
@@ -3198,40 +3363,52 @@ const heldStreamSlots = new Map<string, StreamSlot>();
  * Tries for a free slot; if the origin is saturated, reclaims one of THIS tab's
  * own background streams (LRU, unpinned) and retries — awaiting the reclaimed
  * slot's release so the freed lock is observable before the re-check, rather
- * than racing it and over-evicting. Returns whether a slot is now held.
+ * than racing it and over-evicting. Returns the acquired slot.
  *
- * Returns false only when a fresh tab finds every slot held by OTHER tabs and
- * has nothing of its own to reclaim; the active conversation then opens over
- * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
+ * Returns null if disposed or no slot can be reclaimed. A live entry then opens
+ * over budget and raises the too-many-tabs banner.
  */
-async function acquireStreamSlot(id: string): Promise<boolean> {
-  if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
+async function acquireStreamSlot(id: string): Promise<StreamSlotOwner | null> {
+  const entry = conversationRegistry.peek(id);
+  const held = heldStreamSlots.get(id);
+  if (held !== undefined) {
+    const owner = { slot: held.slot };
+    heldStreamSlots.set(id, owner);
+    return owner;
+  }
   let slot = await getStreamSlotManager().tryAcquire();
   // Inherently sequential: each iteration must fully release a reclaimed slot
   // (so the freed lock is observable) before re-checking, or we'd over-evict.
   /* eslint-disable no-await-in-loop */
   while (slot === null) {
+    if (entry?.disposed) break;
     const evictedId = conversationRegistry.evictLruEvictable(id);
     if (evictedId === null) break;
     const evictedSlot = heldStreamSlots.get(evictedId);
     if (evictedSlot !== undefined) {
       heldStreamSlots.delete(evictedId);
-      await evictedSlot.release();
+      await evictedSlot.slot.release();
     }
     slot = await getStreamSlotManager().tryAcquire();
   }
   /* eslint-enable no-await-in-loop */
-  if (slot !== null) heldStreamSlots.set(id, slot);
+  if (entry?.disposed) {
+    await slot?.release();
+    return null;
+  }
+  const owner = slot === null ? null : { slot };
+  if (owner !== null) heldStreamSlots.set(id, owner);
   setStreamBudgetExceeded(slot === null);
-  return slot !== null;
+  return owner;
 }
 
 /** Hand back `id`'s stream slot when its stream ends (pump exits / disposed). */
-function releaseStreamSlot(id: string): void {
-  const slot = heldStreamSlots.get(id);
-  if (slot === undefined) return;
-  heldStreamSlots.delete(id);
-  void slot.release();
+function releaseStreamSlot(id: string, owner: StreamSlotOwner | null): void {
+  if (owner === null) return;
+  const held = heldStreamSlots.get(id);
+  if (held === owner) heldStreamSlots.delete(id);
+  else if (held?.slot === owner.slot) return;
+  void owner.slot.release();
 }
 
 /**
@@ -3900,17 +4077,19 @@ async function bindStream(
   hydratePending = false,
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
+  const entry = conversationRegistry.peek(id);
   const controller = new AbortController();
+  const stale = () => entry?.disposed || controller.signal.aborted || isConversationDisposed(id);
   const ignoredNativeMessageIds = new Set<string>();
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
-  await acquireStreamSlot(id);
-  if (isConversationDisposed(id)) {
+  const slot = await acquireStreamSlot(id);
+  if (stale()) {
     // Switched away / evicted while awaiting the slot — don't open a dead
     // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
+    releaseStreamSlot(id, slot);
     return;
   }
   set({ abortController: controller });
@@ -3939,8 +4118,8 @@ async function bindStream(
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
-    if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
+    if (stale()) {
+      releaseStreamSlot(id, slot);
       return;
     }
   }
@@ -3948,7 +4127,7 @@ async function bindStream(
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
   void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
-    releaseStreamSlot(id),
+    releaseStreamSlot(id, slot),
   );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
@@ -3995,7 +4174,7 @@ async function bindStream(
       }),
       fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
     ]);
-    if (isConversationDisposed(id)) return;
+    if (stale()) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -4193,7 +4372,7 @@ async function bindStream(
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (isConversationDisposed(id)) return;
+    if (stale()) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
@@ -4678,6 +4857,7 @@ async function rehydrateWindowOnReconnect(
   session: Session,
   preGapIds: Set<string>,
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
+  pendingBeforeFetch: PendingUserMessage[],
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
@@ -4715,6 +4895,11 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...reconcileRecoveredInputs(
+        s,
+        freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
+        pendingBeforeFetch,
+      ),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -4779,6 +4964,7 @@ async function reconcileOnReconnect(
   // before the snapshot fetch are eligible for its flips — see
   // `reconcileElicitationBlocks`.
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
+  const pendingBeforeFetch = get().pendingUserMessages;
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
@@ -4837,6 +5023,7 @@ async function reconcileOnReconnect(
       session,
       preGapIds,
       preGapElicitations,
+      pendingBeforeFetch,
       set,
       get,
       ignoredNativeMessageIds,
@@ -4854,14 +5041,14 @@ async function reconcileOnReconnect(
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
-    // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
-    const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
-    if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
-    }
+    Object.assign(
+      patch,
+      reconcileRecoveredInputs(
+        s,
+        snapshotBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
+        pendingBeforeFetch,
+      ),
+    );
     let nextBlocks = currentBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
@@ -4999,6 +5186,9 @@ export async function startStreamPump(
     typeof window === "undefined"
       ? null
       : window.setInterval(() => {
+          if (!controller.signal.aborted && get().abortController === controller) {
+            set(expireCompactAcknowledgements);
+          }
           if (statusReconcileInFlight) return;
           statusReconcileInFlight = true;
           void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
@@ -5961,6 +6151,48 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   return content;
 }
 
+// Compact echoes acknowledge controls; ordinary transcript text still matches in FIFO order.
+function pendingInputIndex(
+  s: Pick<ChatState, "pendingUserMessages">,
+  content: MessageContentBlock[] | null,
+): number {
+  if (content !== null && isSystemUserContent(content)) return -1;
+  const compact = content !== null && messageContentText(content) === "/compact";
+  const at = s.pendingUserMessages.findIndex((p) => (p.command === "compact") === compact);
+  return at < 0 || s.pendingUserMessages[at]?.initialDraft ? -1 : at;
+}
+
+/** Recovered transcript inputs acknowledge the same pending category as live events. */
+function reconcileRecoveredInputs(
+  s: ChatState,
+  blocks: AnyBlock[],
+  pendingBeforeFetch: PendingUserMessage[],
+): Partial<ChatState> {
+  // Live receipts may already have removed entries while the fetch was in flight.
+  let pendingUserMessages = pendingBeforeFetch;
+  const acknowledged = new Set<string>();
+  for (const block of blocks) {
+    let content: MessageContentBlock[] | null;
+    if (block.type === "user_message") content = block.content;
+    else if (block.type === "slash_command" && block.kind === "command") {
+      content = block.name === "compact" ? [{ type: "input_text", text: "/compact" }] : null;
+    } else continue;
+    const at = pendingInputIndex({ pendingUserMessages }, content);
+    if (at < 0) continue;
+    acknowledged.add(pendingUserMessages[at]!.tempId);
+    pendingUserMessages = pendingUserMessages.filter((_, index) => index !== at);
+  }
+  if (acknowledged.size === 0) return {};
+  return {
+    compactSendLatch: s.pendingUserMessages.some(
+      (p) => p.command !== "compact" && acknowledged.has(p.tempId),
+    )
+      ? null
+      : s.compactSendLatch,
+    pendingUserMessages: s.pendingUserMessages.filter((p) => !acknowledged.has(p.tempId)),
+  };
+}
+
 function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
 }
@@ -6347,6 +6579,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "error":
+      if (event.error.code === "pi_compact_unavailable") {
+        applyToConversation(finishCompact);
+        useChatStore.getState().flushBackgroundQueues();
+      }
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
       // already shows the true model). The error block itself renders
@@ -6450,9 +6686,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Update the context-ring immediately with the post-compaction token
       // estimate so the ring reflects the reduced context without waiting
       // for the next LLM response.completed event.
-      if (event.totalTokens != null) {
-        applyToConversation({ tokensUsed: event.totalTokens });
-      }
+      applyToConversation((s) => ({
+        ...(event.totalTokens != null ? { tokensUsed: event.totalTokens } : {}),
+        ...finishCompact(s),
+      }));
+      useChatStore.getState().flushBackgroundQueues();
       return;
     case "compaction_failed":
       // Compaction failed — history is unchanged. Remove every
@@ -6461,8 +6699,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // so more than one loading block may be present.
       applyToConversation((s) => {
         const blocks = s.blocks.filter((b) => b.type !== "compaction_loading");
-        return blocks.length === s.blocks.length ? {} : { blocks };
+        return {
+          ...(blocks.length === s.blocks.length ? {} : { blocks }),
+          ...finishCompact(s),
+        };
       });
+      useChatStore.getState().flushBackgroundQueues();
       return;
     case "policy_denied":
       // Policy denied the user input — drop the optimistic bubble (the
@@ -6556,6 +6798,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // `waiting` (set above) and `backgroundTaskCount` is untouched, so the
         // "Working…" spinner and sidebar dot keep reflecting the background work.
         if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
+          patch.compactSendLatch = null;
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
             if (s.activeResponse.state !== "cancelled") {
@@ -6737,7 +6980,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      message drained (clearedPendingId = the FIFO-oldest entry's
       //      id), so we drop that exact bubble. Covers snapshot-hydrated
       //      bubbles and optimistic ones whose sender adopted the id.
-      //   2. FIFO head — for an optimistic bubble whose POST hasn't
+      //   2. Compact control, or ordinary FIFO head — for a bubble whose POST hasn't
       //      returned the id to adopt yet (consumed raced ahead), or a
       //      cross-client send. Per-session SSE ordering makes the head
       //      the right entry. No text match: the native transcript
@@ -6749,6 +6992,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
       applyToConversation((s) => {
+        const eventContent = userContentFromEvent(event);
+        // A compact echo can carry the server's FIFO id for an ordinary send.
+        const compact = eventContent !== null && messageContentText(eventContent) === "/compact";
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -6757,9 +7003,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Same precision order as below (named entry, then FIFO head), minus
           // the append.
           const cleared = event.clearedPendingId;
-          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          const at = cleared
+            ? s.pendingUserMessages.findIndex(
+                (p) => p.tempId === cleared && (p.command === "compact") === compact,
+              )
+            : -1;
           if (at >= 0) {
             return {
+              ...(!compact ? { compactSendLatch: null } : {}),
               pendingUserMessages: [
                 ...s.pendingUserMessages.slice(0, at),
                 ...s.pendingUserMessages.slice(at + 1),
@@ -6771,22 +7022,29 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // by user]` record) is synthesized by the CLI, owns no pending entry,
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
-          const eventContent = userContentFromEvent(event);
-          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
-            return {};
-          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+          const headIndex = pendingInputIndex(s, eventContent);
+          return headIndex < 0
+            ? {}
+            : {
+                ...(!compact ? { compactSendLatch: null } : {}),
+                pendingUserMessages: s.pendingUserMessages.filter(
+                  (_, index) => index !== headIndex,
+                ),
+              };
         }
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
         if (cleared) {
-          const idx = s.pendingUserMessages.findIndex((p) => p.tempId === cleared);
+          const idx = s.pendingUserMessages.findIndex(
+            (p) => p.tempId === cleared && (p.command === "compact") === compact,
+          );
           if (idx >= 0) {
             const matched = s.pendingUserMessages[idx]!;
             const content = committedContentFor(event, matched.content);
             if (content === null) return {};
             return {
+              ...(!compact ? { compactSendLatch: null } : {}),
               pendingUserMessages: [
                 ...s.pendingUserMessages.slice(0, idx),
                 ...s.pendingUserMessages.slice(idx + 1),
@@ -6815,17 +7073,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    `[System: …]` notice DOES have a pending entry, but the server
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback.
-        const eventContent = userContentFromEvent(event);
-        const head =
-          (eventContent !== null && isSystemUserContent(eventContent)) ||
-          s.pendingUserMessages[0]?.initialDraft
-            ? undefined
-            : s.pendingUserMessages[0];
+        const headIndex = pendingInputIndex(s, eventContent);
+        const head = s.pendingUserMessages[headIndex];
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
           return {
-            pendingUserMessages: s.pendingUserMessages.slice(1),
+            ...(!compact ? { compactSendLatch: null } : {}),
+            pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== headIndex),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
             blocks: [
@@ -6853,20 +7108,19 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "slash_command":
-      // Claude-native: a `/skill-name` or surfaced CLI command typed
-      // in the web composer round-trips through tmux → Claude TUI →
-      // transcript → `external_conversation_item` (type=slash_command)
-      // → `response.output_item.done`. The Omnigent server bypasses
-      // persistence for these (no `session.input.consumed` fires),
-      // so the optimistic bubble in `pendingUserMessages` would
-      // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; observing clients and drafts still held locally cannot
-      // acknowledge a send, so they just render the block.
+      if (event.kind === "command" && event.name === "compact") {
+        // A raw message echo may already have acknowledged this compact.
+        applyToConversation(settlePendingCompact);
+        return;
+      }
+      // Other native slash commands acknowledge the oldest ordinary send.
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
-        const [, ...rest] = s.pendingUserMessages;
-        return { pendingUserMessages: rest };
+        const at = s.pendingUserMessages.findIndex((p) => p.command !== "compact");
+        if (at < 0 || s.pendingUserMessages[at]?.initialDraft) return {};
+        return {
+          compactSendLatch: null,
+          pendingUserMessages: s.pendingUserMessages.filter((_, index) => index !== at),
+        };
       });
       return;
     case "session_interrupted":

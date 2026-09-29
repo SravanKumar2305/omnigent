@@ -337,21 +337,14 @@ export class ConversationRegistry {
   }
 }
 
-/**
- * Whether an entry holds work the server has no record of.
- *
- * Two shapes of client-only work, each existing nowhere but this tab, so
- * evicting the entry would lose it outright — the cases where dropping an entry
- * is NOT equivalent to a cold load (the hazard `pendingByConversation` was built
- * to survive; pinning replaces that stash):
- *
- *   - an unsettled optimistic bubble (`send`'s POST hasn't returned); and
- *   - a `failedSendDraft` — a send that failed AND rolled its bubble back, so
- *     the draft is the sole surviving copy of the user's text and files. It is
- *     held until the composer restores it on return; evicting first drops it.
- */
+/** Keep local drafts and compact completion tracking alive across navigation. */
 function hasUnsentWork(state: ConversationState): boolean {
-  return state.pendingUserMessages.some((m) => m.posted !== true) || state.failedSendDraft !== null;
+  // Compact has no durable pending-input record; retain its stream through both acks.
+  return (
+    state.compactSendLatch === "owned" ||
+    state.pendingUserMessages.some((m) => m.posted !== true || m.command === "compact") ||
+    state.failedSendDraft !== null
+  );
 }
 
 /** The app's registry. Module-scope, like the store it backs. */

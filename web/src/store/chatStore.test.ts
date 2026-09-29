@@ -2777,47 +2777,72 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
   });
 
-  it("tears the old pump down before rebinding after a failed snapshot", async () => {
-    // A snapshot failure leaves `conversationLoadError` set while the pump it
-    // opened is STILL RUNNING — `bindStream` catches the error without aborting
-    // its controller. Rebinding blind then replaced the stored controller and
-    // left two subscribers on one entry, so any delta with no item id to dedupe
-    // on (live claude-native text) applied twice.
-    seedSession("conv_two_subs", []);
-    let failSnapshot = true;
-    const openedStreams: AbortSignal[] = [];
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_two_subs/stream") {
-        if (init?.signal) openedStreams.push(init.signal);
-        return mockResponse(null, { bodyStream: pushableStream().stream });
-      }
-      // Fail only the FIRST snapshot GET, so the bind errors with its pump live.
-      if (url.split("?")[0] === "/v1/sessions/conv_two_subs" && (init?.method ?? "GET") === "GET") {
-        if (failSnapshot) {
-          failSnapshot = false;
-          return mockResponse({}, { ok: false, status: 500 });
+  it.each(["message", "compact"])(
+    "retains the stream slot when %s rebinds after a failed snapshot",
+    async (kind) => {
+      // A snapshot failure leaves `conversationLoadError` set while the pump it
+      // opened is STILL RUNNING — `bindStream` catches the error without aborting
+      // its controller. Rebinding blind then replaced the stored controller and
+      // left two subscribers on one entry, so any delta with no item id to dedupe
+      // on (live claude-native text) applied twice.
+      const slots = makeFakeSlotManager();
+      setStreamSlotManagerForTest(slots);
+      const sinks: StreamSink[] = [];
+      seedSession("conv_two_subs", []);
+      let failSnapshot = true;
+      const openedStreams: AbortSignal[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/v1/sessions/conv_two_subs/stream") {
+          if (init?.signal) openedStreams.push(init.signal);
+          const sink = pushableStream();
+          sinks.push(sink);
+          return mockResponse(null, { bodyStream: sink.stream });
         }
+        // Fail only the FIRST snapshot GET, so the bind errors with its pump live.
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_two_subs" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          if (failSnapshot) {
+            failSnapshot = false;
+            return mockResponse({}, { ok: false, status: 500 });
+          }
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_two_subs");
+      const entry = conversationRegistry.peek("conv_two_subs")!;
+      // The failed bind: error recorded, but its pump is still open.
+      expect(entry.getState().conversationLoadError).not.toBeNull();
+      expect(openedStreams).toHaveLength(1);
+      expect(openedStreams[0]!.aborted).toBe(false);
+
+      // Sending rebinds, because the entry is not stream-current.
+      if (kind === "message") {
+        await useChatStore.getState().send("after a failed load", "agent_xyz");
+      } else {
+        useChatStore.setState({ sessionStatus: "running" });
+        await useChatStore.getState().compact({ queue: true });
+        useChatStore.setState({ conversationId: "conv_other" });
+        seedConversationsCache([conv("conv_two_subs", "idle")]);
+        useChatStore.getState().flushBackgroundQueues();
+        await tick();
       }
-      return defaultFetchHandler(input, init);
-    });
+      expect(slots.heldByTab()).toBe(1);
+      sinks[0]!.error(new DOMException("Aborted", "AbortError"));
+      await tick();
+      expect(slots.heldByTab()).toBe(1);
 
-    await useChatStore.getState().switchTo("conv_two_subs");
-    const entry = conversationRegistry.peek("conv_two_subs")!;
-    // The failed bind: error recorded, but its pump is still open.
-    expect(entry.getState().conversationLoadError).not.toBeNull();
-    expect(openedStreams).toHaveLength(1);
-    expect(openedStreams[0]!.aborted).toBe(false);
-
-    // Sending rebinds, because the entry is not stream-current.
-    await useChatStore.getState().send("after a failed load", "agent_xyz");
-
-    // The first pump was aborted rather than orphaned — one live subscriber.
-    expect(openedStreams).toHaveLength(2);
-    expect(openedStreams[0]!.aborted).toBe(true);
-    expect(openedStreams[1]!.aborted).toBe(false);
-    expect(entry.getState().conversationLoadError).toBeNull();
-  });
+      // The first pump was aborted rather than orphaned — one live subscriber.
+      expect(openedStreams).toHaveLength(2);
+      expect(openedStreams[0]!.aborted).toBe(true);
+      expect(openedStreams[1]!.aborted).toBe(false);
+      expect(entry.getState().conversationLoadError).toBeNull();
+      sinks[1]!.close();
+    },
+  );
 
   it("degrades gracefully when stream rebind fails — message still posts", async () => {
     useChatStore.setState({
@@ -11034,45 +11059,203 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("acks an optimistic user bubble when reconnect backfills its committed item", async () => {
-    const before = userMessage("ack_pre", "before the gap");
-    seedSession("conv_reconnect_ack", [before]);
-    const sinks = routeStreamOpens();
-    const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_reconnect_ack",
-      abortController: controller,
-      blocks: itemsToBlocks([before]),
-      pendingUserMessages: [
-        {
-          tempId: "pend_gap",
-          content: [{ type: "input_text", text: "only once" }],
-          posted: true,
-        },
-      ],
-    });
+  it.each(["ordinary", "compact-message", "compact-command", "skill"])(
+    "reconciles recovered %s with mixed pending inputs",
+    async (kind) => {
+      const compact = kind.startsWith("compact");
+      const before = userMessage("ack_pre", "before the gap");
+      seedSession("conv_reconnect_ack", [before]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_reconnect_ack",
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [
+          {
+            tempId: "pend_compact",
+            command: "compact",
+            posted: true,
+            content: [{ type: "input_text", text: "/compact" }],
+          },
+          {
+            tempId: "pend_gap",
+            content: [{ type: "input_text", text: "only once" }],
+            posted: true,
+          },
+        ],
+      });
 
-    const loop = startStreamPump("conv_reconnect_ack", controller, setState, getState);
-    await drainAsync();
-    expect(sinks).toHaveLength(1);
+      const loop = startStreamPump("conv_reconnect_ack", controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
 
-    const committed = userMessage("ack_gap", "only once");
-    const reply = assistantMessage("ack_gap", "the reply");
-    seedSessionItems("conv_reconnect_ack", [before, committed, reply]);
-    sinks[0]!.error();
-    await drainAsync();
-    expect(sinks).toHaveLength(2);
+      const committed: ConversationItem =
+        kind === "compact-command" || kind === "skill"
+          ? {
+              id: "ack_gap",
+              response_id: "ack_turn",
+              status: "completed",
+              type: "slash_command",
+              kind: compact ? "command" : "skill",
+              name: compact ? "compact" : "review",
+              arguments: "",
+              output: null,
+            }
+          : userMessage("ack_gap", compact ? "/compact" : "only once");
+      const reply = assistantMessage("ack_gap", "the reply");
+      seedSessionItems("conv_reconnect_ack", [before, committed, reply]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
 
-    const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual([
+        compact ? "pend_gap" : "pend_compact",
+      ]);
+      expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
+        itemsToBlocks([before, committed, reply]).map((b) => b.ctx.itemId),
+      );
 
-    const last = sinks[1]!;
-    last.push("data: [DONE]\n\n");
-    last.close();
-    await drainAsync(2);
-    await loop;
-  });
+      const last = sinks[1]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each(["foreground", "background", "still-running", "still-compacting", "still-streaming"])(
+    "expires a missing compact acknowledgement in %s without queued work",
+    async (mode) => {
+      seedSession("conv_compact_timeout", []);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const bound = bindConversationForTest("conv_compact_timeout", {
+        abortController: controller,
+        sessionHarness: "claude-native",
+        isNativeTerminalSession: true,
+      });
+      const loop = startStreamPump("conv_compact_timeout", controller, bound.set, bound.get);
+      await drainAsync();
+      await useChatStore.getState().compact();
+      if (mode !== "still-compacting") {
+        handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+      }
+      expect(bound.get().pendingUserMessages).toHaveLength(1);
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      if (mode !== "foreground") useChatStore.setState({ conversationId: "conv_other" });
+      if (mode === "still-running") bound.set({ sessionStatus: "running" });
+      if (mode === "still-streaming") {
+        bound.set({ activeResponse: { responseId: "in-flight", state: "streaming", error: null } });
+      }
+      await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      expect(bound.get().pendingUserMessages).toHaveLength(1);
+      const remaining = bound.get().pendingUserMessages[0]!.compactAckDeadline! - Date.now();
+      await advanceWithHeartbeats(
+        sinks[0]!,
+        remaining + ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
+      );
+      if (mode.startsWith("still-")) {
+        expect(bound.get().pendingUserMessages).toHaveLength(1);
+        if (mode === "still-compacting") {
+          handleSessionEvent(
+            { type: "compaction_completed", totalTokens: null },
+            "conv_compact_timeout",
+          );
+        }
+        bound.set({ activeResponse: null });
+        handleSessionEvent(
+          { type: "session_status", conversationId: "conv_compact_timeout", status: "idle" },
+          "conv_compact_timeout",
+        );
+        await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      }
+      expect(bound.get().pendingUserMessages).toEqual([]);
+      conversationRegistry.setActive(null);
+      expect(conversationRegistry.evictLruEvictable()).toBe("conv_compact_timeout");
+      sinks[0]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each([false, true])(
+    "does not double-acknowledge a live receipt during recovery (rendered=%s)",
+    async (rendered) => {
+      const before = userMessage("review-before", "before gap");
+      const skill: ConversationItem = {
+        id: "review-skill",
+        response_id: "review-turn",
+        status: "completed",
+        type: "slash_command",
+        kind: "skill",
+        name: "review",
+        arguments: "",
+        output: null,
+      };
+      seedSession("conv_review_race", [before]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_review_race",
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [
+          {
+            tempId: "compact",
+            command: "compact",
+            content: [{ type: "input_text", text: "/compact" }],
+          },
+          { tempId: "skill", content: [{ type: "input_text", text: "/review" }] },
+          { tempId: "following", content: [{ type: "input_text", text: "after review" }] },
+        ],
+      });
+      const loop = startStreamPump("conv_review_race", controller, setState, getState);
+      await drainAsync();
+      seedSessionItems("conv_review_race", [before, skill]);
+      const prior = fetchMock.getMockImplementation()!;
+      let releaseItems: (() => void) | undefined;
+      let intercepted = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (!intercepted && String(input).startsWith("/v1/sessions/conv_review_race/items")) {
+          intercepted = true;
+          return new Promise<Response>((resolve) => {
+            releaseItems = () => resolve(defaultFetchHandler(input, init));
+          });
+        }
+        return prior(input, init);
+      });
+      sinks[0]!.error();
+      await drainAsync();
+      handleSessionEvent({
+        type: "slash_command",
+        kind: "skill",
+        name: "review",
+        arguments: "",
+        output: null,
+        agentName: "test",
+        itemId: skill.id,
+        responseId: "review-turn",
+      });
+      if (rendered) useChatStore.setState({ blocks: itemsToBlocks([before, skill]) });
+      useChatStore.setState((s) => ({
+        pendingUserMessages: [
+          ...s.pendingUserMessages,
+          { tempId: "new-send", content: [{ type: "input_text", text: "sent during recovery" }] },
+        ],
+      }));
+      expect(releaseItems).toBeDefined();
+      releaseItems!();
+      await drainAsync();
+      const remaining = useChatStore.getState().pendingUserMessages.map((p) => p.tempId);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+      expect(remaining).toEqual(["compact", "following", "new-send"]);
+    },
+  );
 
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {
     seedSession("conv_mcp_gap", []);
@@ -11635,6 +11818,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       conversationId: "conv_bigap",
       abortController: controller,
       blocks: itemsToBlocks(windowItems),
+      pendingUserMessages: [
+        {
+          tempId: "pend_compact",
+          command: "compact",
+          content: [{ type: "input_text", text: "/compact" }],
+          posted: true,
+        },
+        { tempId: "pend_gap", content: [{ type: "input_text", text: "gap input" }], posted: true },
+      ],
       hasMoreHistory: true,
       oldestItemId: windowItems[0]!.id,
     });
@@ -11652,6 +11844,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
 
     const state = useChatStore.getState();
+    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_compact"]);
     // The window was replaced wholesale with one fresh window fetch, exactly
     // as a cold bind loads it — not left with a mid-transcript hole, and not
     // paged in over several requests (which would shift the transcript under
@@ -14860,6 +15053,8 @@ describe("chatStore — origin-wide stream slots", () => {
     expect(useChatStore.getState().streamBudgetExceeded).toBe(false);
     expect(conversationRegistry.has("conv_a")).toBe(true);
     expect(conversationRegistry.has("conv_b")).toBe(true);
+    initChatStore(client);
+    expect(slots.heldByTab()).toBe(0);
   });
 
   it("reclaims this tab's own LRU background stream when the origin is saturated", async () => {
@@ -15392,4 +15587,465 @@ describe("chatStore — one error card per failed turn", () => {
     });
     expect(errorBlocks()).toHaveLength(2);
   });
+});
+
+describe("compact message queue", () => {
+  const eventPosts = () =>
+    fetchMock.mock.calls.filter(
+      ([url, init]) => String(url).endsWith("/events") && init?.method === "POST",
+    );
+
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_compact",
+      boundAgentId: null,
+      sessionStatus: "running",
+      isNativeTerminalSession: true,
+    });
+  });
+
+  it.each(["direct", "flush", "steer", "steerAll", "background"])(
+    "dispatches compact as a control via %s with a pending bubble",
+    async (mode) => {
+      if (mode === "direct") {
+        const send = useChatStore.getState().compact();
+        expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+        await send;
+      } else {
+        await useChatStore.getState().compact({ queue: true });
+        const [queued] = useChatStore.getState().queuedMessages;
+        expect(queued).toMatchObject({ text: "/compact", command: "compact" });
+        expect(eventPosts()).toHaveLength(0);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+        if (mode === "flush") {
+          useChatStore.setState({ sessionStatus: "idle" });
+          useChatStore.getState().maybeFlushQueuedHead();
+        } else if (mode === "steer") {
+          useChatStore.getState().steerMessage(queued!.queueId);
+        } else if (mode === "steerAll") {
+          useChatStore.getState().steerAllQueuedMessages("conv_compact");
+        } else {
+          seedConversationsCache([conv("conv_compact", "idle"), conv("conv_other", "running")]);
+          useChatStore.setState({ conversationId: "conv_other" });
+          useChatStore.getState().flushBackgroundQueues();
+        }
+        await tick();
+      }
+      expect(eventPosts()).toHaveLength(1);
+      const [url, init] = eventPosts()[0]!;
+      expect(String(url)).toContain("/conv_compact/events");
+      expect(JSON.parse(init!.body as string)).toEqual({ type: "compact", data: {} });
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      expect(conversationRegistry.peek("conv_compact")!.getState().pendingUserMessages).toEqual([
+        expect.objectContaining({
+          command: "compact",
+          content: [{ type: "input_text", text: "/compact" }],
+          posted: true,
+        }),
+      ]);
+    },
+  );
+
+  it.each([
+    ["pi-native", "completed", false],
+    ["pi-native", "failed", false],
+    ["pi-native", "unavailable", false],
+    ["claude-native", "command", false],
+    ["claude-native", "message-then-command", false],
+    ["claude-native", "mirrored-message-then-command", false],
+    ["pi-native", "completed", true],
+    ["claude-native", "message-then-command", true],
+    ["claude-native", "mirrored-message-then-command", true],
+  ] as const)(
+    "settles %s compact via %s (queued=%s) without consuming other sends",
+    async (harness, outcome, queue) => {
+      const ordinary: PendingUserMessage = {
+        tempId: "ordinary",
+        content: [{ type: "input_text", text: "keep working" }],
+        posted: true,
+      };
+      useChatStore.setState({ sessionHarness: harness, pendingUserMessages: [] });
+      await useChatStore.getState().compact({ queue });
+      if (queue) {
+        useChatStore.setState({ sessionStatus: "idle" });
+        useChatStore.getState().maybeFlushQueuedHead();
+        await tick();
+      }
+      const [compact] = useChatStore.getState().pendingUserMessages;
+      expect(compact?.command).toBe("compact");
+      expect(useChatStore.getState().compactSendLatch).toBe(queue ? "owned" : null);
+      expect(useChatStore.getState().status).toBe(queue ? "streaming" : "idle");
+      useChatStore.setState({ pendingUserMessages: [ordinary, compact!] });
+      if (harness !== "claude-native") {
+        if (outcome === "unavailable") {
+          handleSessionEvent({
+            type: "error",
+            source: "execution",
+            toolName: null,
+            error: { code: "pi_compact_unavailable", message: "Compaction unavailable" },
+          });
+        } else {
+          handleSessionEvent({ type: "compaction_in_progress" });
+          expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, compact]);
+          handleSessionEvent(
+            outcome === "completed"
+              ? { type: "compaction_completed", totalTokens: 123 }
+              : { type: "compaction_failed" },
+          );
+        }
+      } else {
+        handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+        expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary, compact]);
+        // Completion can precede the transcript acknowledgement after navigation.
+        expect(useChatStore.getState().compactSendLatch).toBe(queue ? "released" : null);
+        conversationRegistry.setActive(null);
+        expect(conversationRegistry.evictLruEvictable()).not.toBe("conv_compact");
+        conversationRegistry.setActive("conv_compact");
+        if (outcome !== "command") {
+          const echo = userMessage(`compact_echo_${queue}`, "/compact");
+          if (outcome === "mirrored-message-then-command") {
+            useChatStore.setState({ blocks: itemsToBlocks([echo]) });
+          }
+          handleSessionEvent({
+            type: "session_input_consumed",
+            itemId: echo.id,
+            itemType: "message",
+            clearedPendingId: ordinary.tempId,
+            data: { role: "user", content: [{ type: "input_text", text: "/compact" }] },
+          });
+          expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary]);
+          if (outcome === "message-then-command")
+            expect(useChatStore.getState().blocks.at(-1)).toMatchObject({
+              stableKey: compact!.tempId,
+            });
+        }
+        handleSessionEvent({
+          type: "slash_command",
+          kind: "command",
+          name: "compact",
+          arguments: "",
+          output: null,
+          agentName: "claude-native-ui",
+          itemId: "compact-command",
+          responseId: "compact-turn",
+        });
+      }
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_compact",
+        status: "idle",
+      });
+      expect(useChatStore.getState().compactSendLatch).toBeNull();
+      expect(useChatStore.getState().status).toBe("idle");
+      expect(useChatStore.getState().pendingUserMessages).toEqual([ordinary]);
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "ordinary_echo",
+        itemType: "message",
+        data: { role: "user", content: ordinary.content },
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(
+        useChatStore
+          .getState()
+          .blocks.filter((b) => b.type === "user_message" && b.ctx.itemId === "ordinary_echo"),
+      ).toEqual([
+        expect.objectContaining({ stableKey: ordinary.tempId, content: ordinary.content }),
+      ]);
+      conversationRegistry.setActive(null);
+      expect(conversationRegistry.evictLruEvictable()).toBe("conv_compact");
+    },
+  );
+
+  it.each([
+    ["foreground", "idle"],
+    ["foreground", "completed"],
+    ["foreground", "failed"],
+    ["foreground", "timeout"],
+    ["background", "completed"],
+    ["background", "failed"],
+    ["background", "completed-before-ack"],
+    ["background", "timeout"],
+    ["bind-idle", "completed"],
+    ["evicted", "completed"],
+    ["navigate-after-post", "completed"],
+  ] as const)("holds the %s queue until compact %s", async (mode, outcome) => {
+    sessionLabels.set("conv_compact", { "omnigent.wrapper": "claude-code-native-ui" });
+    useChatStore.setState({ sessionHarness: "claude-native", boundAgentId: "agent_test" });
+    await useChatStore.getState().compact({ queue: true });
+    useChatStore.getState().enqueueMessage("after compact");
+    useChatStore.setState({ sessionStatus: "idle" });
+    seedConversationsCache([conv("conv_compact", "idle"), conv("conv_other", "idle")]);
+    let acknowledge: (() => void) | undefined;
+    if (outcome === "completed-before-ack" || mode === "bind-idle") {
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/events") &&
+          init?.method === "POST" &&
+          JSON.parse(init.body as string).type === "compact" &&
+          outcome === "completed-before-ack"
+        ) {
+          return new Promise<Response>((resolve) => {
+            acknowledge = () => resolve(mockResponse({ queued: false }));
+          });
+        }
+        if (
+          mode === "bind-idle" &&
+          String(input).split("?")[0]!.endsWith("/sessions/conv_compact")
+        ) {
+          handleSessionEvent(
+            { type: "session_status", conversationId: "conv_compact", status: "idle" },
+            "conv_compact",
+          );
+        }
+        return defaultFetchHandler(input, init);
+      });
+    }
+    if (mode === "foreground" || mode === "navigate-after-post") {
+      useChatStore.getState().maybeFlushQueuedHead();
+    } else {
+      if (mode === "evicted") releaseConversation("conv_compact");
+      useChatStore.setState({ conversationId: "conv_other" });
+      useChatStore.getState().flushBackgroundQueues();
+    }
+    await tick();
+    if (mode === "navigate-after-post") useChatStore.setState({ conversationId: "conv_other" });
+    const flush = () =>
+      mode === "foreground"
+        ? useChatStore.getState().maybeFlushQueuedHead()
+        : useChatStore.getState().flushBackgroundQueues();
+    flush();
+    await tick();
+    expect(eventPosts()).toHaveLength(1);
+    const entry = conversationRegistry.peek("conv_compact")!;
+    expect(entry.getState().status).toBe("streaming");
+    if (mode === "background" || mode === "evicted" || mode === "bind-idle")
+      expect(entry.getState().abortController).not.toBeNull();
+    // Transcript acknowledgement must not release the queue or its completion stream.
+    if (outcome !== "timeout") {
+      handleSessionEvent(
+        {
+          type: "slash_command",
+          kind: "command",
+          name: "compact",
+          arguments: "",
+          output: null,
+          agentName: "claude-native-ui",
+          itemId: "compact-command",
+          responseId: "compact-turn",
+        },
+        "conv_compact",
+      );
+    }
+    flush();
+    await tick();
+    expect(eventPosts()).toHaveLength(1);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["after compact"]);
+    expect(conversationRegistry.evictLruEvictable("conv_other")).not.toBe("conv_compact");
+    expect(entry.disposed).toBe(false);
+    if (outcome === "timeout") {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 180_001);
+    } else {
+      handleSessionEvent(
+        outcome === "idle"
+          ? { type: "session_status", conversationId: "conv_compact", status: "idle" }
+          : outcome === "failed"
+            ? { type: "compaction_failed" }
+            : { type: "compaction_completed", totalTokens: null },
+        "conv_compact",
+      );
+    }
+    flush();
+    if (acknowledge) {
+      await tick();
+      expect(eventPosts()).toHaveLength(1);
+      acknowledge();
+    }
+    await tick();
+    expect(eventPosts().map(([, init]) => JSON.parse(init!.body as string).type)).toEqual([
+      "compact",
+      "message",
+    ]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(entry.getState().compactSendLatch).toBeNull();
+    expect(entry.getState().pendingUserMessages.some((p) => p.command === "compact")).toBe(false);
+    // A late duplicate completion must not affect the next send or resend it.
+    handleSessionEvent({ type: "compaction_completed", totalTokens: null }, "conv_compact");
+    expect(eventPosts()).toHaveLength(2);
+    if (mode === "foreground") expect(entry.getState().status).toBe("streaming");
+  });
+
+  it.each([
+    ["message", "failed", false],
+    ["message", "failed", true],
+    ["message", "denied", false],
+    ["message", "accepted", false],
+    ["message", "accepted", true],
+    ["message", "echoed", true],
+    ["skill", "failed", false],
+    ["skill", "failed", true],
+    ["skill", "denied", true],
+    ["skill", "accepted", false],
+    ["skill", "accepted", true],
+    ["skill", "echoed", true],
+  ] as const)(
+    "settles compact with a %s steer %s (completion first=%s)",
+    async (kind, result, completionFirst) => {
+      seedSession("conv_compact", []);
+      sessionLabels.set("conv_compact", { "omnigent.wrapper": "pi-native-ui" });
+      useChatStore.setState({ conversationId: null });
+      await useChatStore.getState().switchTo("conv_compact");
+      await useChatStore.getState().compact();
+      expect(useChatStore.getState().compactSendLatch).toBe("owned");
+      let finishPost!: () => void;
+      let postCount = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/events") && init?.method === "POST") {
+          if (postCount++ > 0) return Promise.reject(new TypeError("Follow-up rejected"));
+          return new Promise<Response>((resolve, reject) => {
+            finishPost = () =>
+              result === "failed"
+                ? reject(new TypeError("Steer rejected"))
+                : resolve(mockResponse({ queued: false, denied: result === "denied" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const send =
+        kind === "message"
+          ? useChatStore.getState().send("keep working", "agent_test")
+          : useChatStore.getState().sendSlashCommand("review", "", "agent_test");
+      // A second steer may reject after the first has already been acknowledged.
+      const rejectedFollowUp =
+        result === "echoed" ? useChatStore.getState().send("follow-up", "agent_test") : null;
+      await tick();
+      if (result === "echoed") {
+        handleSessionEvent(
+          kind === "message"
+            ? {
+                type: "session_input_consumed",
+                itemId: "steer-echo",
+                itemType: "message",
+                data: { role: "user", content: [{ type: "input_text", text: "keep working" }] },
+              }
+            : {
+                type: "slash_command",
+                kind: "skill",
+                name: "review",
+                arguments: "",
+                output: null,
+                agentName: "pi-native-ui",
+                itemId: "steer-echo",
+                responseId: "steer-turn",
+              },
+        );
+      }
+      if (completionFirst) handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+      expect(useChatStore.getState().status).toBe("streaming");
+      finishPost();
+      await send;
+      await rejectedFollowUp;
+      if (!completionFirst) {
+        expect(useChatStore.getState().status).toBe("streaming");
+        handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+      }
+      expect(useChatStore.getState().compactSendLatch).toBeNull();
+      expect(useChatStore.getState().status).toBe(
+        result === "accepted" || result === "echoed" ? "streaming" : "idle",
+      );
+      expect(useChatStore.getState().pendingUserMessages).toHaveLength(
+        result === "accepted" ? 1 : 0,
+      );
+    },
+  );
+
+  it("rolls back and retries compact after navigation replaces its binding entry", async () => {
+    seedSession("conv_compact", []);
+    sessionLabels.set("conv_compact", { "omnigent.wrapper": "pi-native-ui" });
+    await useChatStore.getState().compact({ queue: true });
+    releaseConversation("conv_compact");
+    useChatStore.setState({ conversationId: "conv_other" });
+    seedConversationsCache([conv("conv_compact", "idle"), conv("conv_other", "idle")]);
+    const slots = makeFakeSlotManager();
+    const acquire = slots.tryAcquire;
+    let resumeBind!: () => void;
+    slots.tryAcquire = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resumeBind = () => {
+              void acquire().then(resolve);
+            };
+          }),
+      )
+      .mockImplementation(acquire);
+    setStreamSlotManagerForTest(slots);
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    const oldEntry = conversationRegistry.peek("conv_compact")!;
+    expect(oldEntry.getState().pendingUserMessages).toHaveLength(1);
+    await useChatStore.getState().switchTo("conv_compact");
+    expect(oldEntry.disposed).toBe(true);
+    resumeBind();
+    await tick();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(slots.heldByTab()).toBe(1);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_compact/stream")),
+    ).toHaveLength(1);
+    useChatStore.getState().steerMessage(useChatStore.getState().queuedMessages[0]!.queueId);
+    await tick();
+    expect(eventPosts()).toHaveLength(1);
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    handleSessionEvent({ type: "compaction_completed", totalTokens: null });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().status).toBe("idle");
+  });
+
+  it.each(["idle", "running", "bulk", "background", "background-bind"] as const)(
+    "restores a failed compact without changing the %s turn",
+    async (mode) => {
+      const background = mode.startsWith("background");
+      const sessionStatus = mode === "running" ? "running" : "idle";
+      await useChatStore.getState().compact({ queue: true });
+      const [queued] = useChatStore.getState().queuedMessages;
+      useChatStore.setState({
+        sessionStatus,
+        status: sessionStatus === "running" ? "streaming" : "idle",
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (
+          mode === "background-bind"
+            ? url.split("?")[0]!.endsWith("/sessions/conv_compact")
+            : url.endsWith("/events") && init?.method === "POST"
+        ) {
+          return Promise.reject(new TypeError("Runner unavailable"));
+        }
+        return defaultFetchHandler(input, init);
+      });
+      if (background) {
+        seedConversationsCache([conv("conv_compact", "idle"), conv("conv_other", "idle")]);
+        useChatStore.setState({ conversationId: "conv_other" });
+        useChatStore.getState().flushBackgroundQueues();
+      } else if (mode === "bulk") {
+        useChatStore.getState().steerAllQueuedMessages("conv_compact");
+      } else {
+        useChatStore.getState().steerMessage(queued!.queueId);
+      }
+      await tick();
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        background ? queued : { ...queued, requiresRetry: true },
+      ]);
+      const state = conversationRegistry.peek("conv_compact")!.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.compactSendLatch).toBeNull();
+      expect(state.sessionStatus).toBe(sessionStatus);
+      expect(state.status).toBe(sessionStatus === "running" ? "streaming" : "idle");
+      if (mode === "background-bind") expect(eventPosts()).toHaveLength(0);
+    },
+  );
 });

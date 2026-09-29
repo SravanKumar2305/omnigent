@@ -2990,7 +2990,7 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
-      case "/compact":
+      case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
           return true;
@@ -2998,13 +2998,22 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        void useChatStore
-          .getState()
-          .compact()
+        const chat = useChatStore.getState();
+        void chat
+          .compact({
+            queue: shouldQueueSend(
+              chat.conversationId,
+              chat.status,
+              chat.sessionStatus,
+              chat.queuedMessages,
+              readAlwaysSteer(),
+            ),
+          })
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Compact failed");
           });
         return true;
+      }
       case "/effort": {
         if (!showEffort) return false;
         const valid = [...effortLevels, "default"];
