@@ -177,7 +177,11 @@ async def test_claude_completion_matches_real_child(db_uri: str, completion: str
         )
     await record_claude_subagent_return(parent.id, item, store)
     await record_claude_subagent_return(parent.id, item, store)
-    items = store.list_items(parent.id).data
+    items = [
+        row
+        for row in store.list_items(parent.id, type="resource_event").data
+        if row.data.event_type == "session.subagent.returned"
+    ]
     assert len(items) == 1
     assert items[0].data.resource_id == child.id
     assert items[0].data.resource == {
@@ -209,10 +213,16 @@ async def test_external_item_paths_record_returned_child_once(db_uri: str, batch
         else:
             await _persist_external_conversation_item(parent.id, parent, body, store)
     items = store.list_items(parent.id).data
-    assert [item.type for item in items] == ["function_call_output", "resource_event"]
-    assert items[0].data.subagent_return_id == "agent-1"
-    assert items[1].data.resource_id == child.id
-    assert items[1].data.event_type == "session.subagent.returned"
+    outputs = [item for item in items if item.type == "function_call_output"]
+    activity = [
+        item
+        for item in items
+        if item.type == "resource_event" and item.data.event_type == "session.subagent.returned"
+    ]
+    assert len(outputs) == 1
+    assert outputs[0].data.subagent_return_id == "agent-1"
+    assert len(activity) == 1
+    assert activity[0].data.resource_id == child.id
 
 
 @pytest.mark.parametrize(
@@ -308,6 +318,21 @@ async def test_claude_result_arriving_before_child_discovery_is_reconciled(
         },
     )
     await _persist_external_conversation_items(parent.id, [body], store)
+    store.append(
+        parent.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"intervening-{index}",
+                data=MessageData(
+                    role="assistant",
+                    agent="Claude",
+                    content=[{"type": "output_text", "text": f"Update {index}"}],
+                ),
+            )
+            for index in range(101)
+        ],
+    )
     child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
     store.set_labels(
         child.id,
@@ -320,7 +345,10 @@ async def test_claude_result_arriving_before_child_discovery_is_reconciled(
     await record_subagent_activity(child.id, "delegated", store)
     if completion == "failed":
         assert [
-            row.data.event_type for row in store.list_items(parent.id, type="resource_event").data
+            row.data.event_type
+            for row in store.list_items(parent.id, type="resource_event").data
+            if row.data.event_type.startswith("session.subagent.")
+            and row.data.event_type != "session.subagent.completion-observed"
         ] == ["session.subagent.delegated"]
         await record_claude_subagent_return(
             parent.id,
@@ -342,8 +370,16 @@ async def test_claude_result_arriving_before_child_discovery_is_reconciled(
             store,
         )
     assert [
-        row.data.event_type for row in store.list_items(parent.id, type="resource_event").data
+        row.data.event_type
+        for row in store.list_items(parent.id, type="resource_event").data
+        if row.data.event_type.startswith("session.subagent.")
+        and row.data.event_type != "session.subagent.completion-observed"
     ] == ["session.subagent.delegated", "session.subagent.returned"]
-    assert store.list_items(parent.id, type="resource_event").data[-1].data.resource["status"] == (
+    activity = [
+        row
+        for row in store.list_items(parent.id, type="resource_event").data
+        if row.data.event_type == "session.subagent.returned"
+    ]
+    assert activity[0].data.resource["status"] == (
         "failed" if completion == "failed" else "completed"
     )

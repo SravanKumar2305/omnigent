@@ -103,6 +103,103 @@ async def test_direct_terminal_envelope_does_not_drain_unrelated_web_input(
 
 
 @pytest.mark.asyncio
+async def test_real_agent_team_notification_stays_hidden_and_does_not_drain_input(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """Replay the parent-side records emitted by a named Claude Agent Teams worker."""
+    task_notification = (
+        """<task-notification>
+<task-id>ae6a7749a5dc6041c</task-id>
+<tool-use-id>toolu_agent_team</tool-use-id>
+<status>completed</status>
+<summary>Agent "Message probe" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background """
+        """children of its own.</note>
+<result>TEAM_DONE</result>
+</task-notification>"""
+    )
+    transcript = tmp_path / "agent-team.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {
+                    "type": "assistant",
+                    "uuid": "agent-team-launch",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_agent_team",
+                                "name": "Agent",
+                                "input": {
+                                    "description": "Message probe",
+                                    "name": "reporter",
+                                    "subagent_type": "general-purpose",
+                                    "prompt": "Reply exactly TEAM_DONE.",
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "agent-team-launch-result",
+                    "parentUuid": "agent-team-launch",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_agent_team",
+                                "content": "Async agent launched successfully.",
+                            }
+                        ],
+                    },
+                    "toolUseResult": {
+                        "isAsync": True,
+                        "status": "async_launched",
+                        "agentId": "ae6a7749a5dc6041c",
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "agent-team-notification",
+                    "origin": {"kind": "task-notification", "producer": "session-task"},
+                    "message": {"role": "user", "content": task_notification},
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _, _, parsed = read_transcript_items_since(transcript, 0, agent_name="Claude")
+    assert [item.item_type for item in parsed] == [
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert json.loads(parsed[0].data["arguments"])["name"] == "reporter"
+    assert parsed[-1].data["is_meta"] is True
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Agent Teams parent")
+    pending = pending_inputs.record(conv.id, [{"type": "input_text", "text": "Still queued"}])
+    for item in parsed:
+        body = SessionEventInput.model_validate(_external_conversation_item_event(item))
+        await _persist_external_conversation_item(conv.id, conv, body, store)
+
+    rows = store.list_items(conv.id).data
+    user_messages = [row for row in rows if getattr(row.data, "role", None) == "user"]
+    assert len(user_messages) == 1
+    assert user_messages[0].data.is_meta is True
+    assert user_messages[0].data.user_authored is False
+    assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == [pending]
+
+
+@pytest.mark.asyncio
 async def test_trusted_internal_envelope_never_consumes_same_text_user_submission(
     db_uri: str,
 ) -> None:

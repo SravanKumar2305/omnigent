@@ -26,6 +26,9 @@ _TERMINAL_TASK_STATUS_RE = re.compile(
     r"<status>\s*(completed|failed|cancelled|killed)\s*</status>"
 )
 _TASK_ID_RE = re.compile(r"<(task-id|tool-use-id)>\s*([^<]+?)\s*</\1>")
+_COMPLETION_EVENT_TYPE = "session.subagent.completion-observed"
+_COMPLETION_RESOURCE_TYPE = "subagent_completion"
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 def native_subagent_terminal_status(
@@ -69,6 +72,67 @@ def _title(child: Conversation) -> str:
     return title.partition(":")[2] or title or child.sub_agent_name or "Sub-agent"
 
 
+def _completion_marker_id(kind: str, native_id: str) -> str:
+    key = f"claude-subagent-completion:{kind}:{native_id}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
+def _completion_marker(kind: str, native_id: str, status: str) -> NewConversationItem:
+    stable_id = _completion_marker_id(kind, native_id)
+    return NewConversationItem(
+        type="resource_event",
+        stable_id=stable_id,
+        response_id="subagent_" + stable_id,
+        data=ResourceEventData(
+            event_type=_COMPLETION_EVENT_TYPE,
+            resource_id=native_id,
+            resource_type=_COMPLETION_RESOURCE_TYPE,
+            resource={"kind": kind, "status": status},
+        ),
+    )
+
+
+def _completion_status(
+    parent_id: str,
+    kind: str,
+    native_id: str,
+    store: ConversationStore,
+) -> str | None:
+    marker = store.get_item(parent_id, _completion_marker_id(kind, native_id))
+    if marker is None or not isinstance(marker.data, ResourceEventData):
+        return None
+    resource = marker.data.resource
+    status = resource.get("status") if isinstance(resource, dict) else None
+    if (
+        marker.data.event_type != _COMPLETION_EVENT_TYPE
+        or marker.data.resource_id != native_id
+        or marker.data.resource_type != _COMPLETION_RESOURCE_TYPE
+        or not isinstance(resource, dict)
+        or resource.get("kind") != kind
+        or not isinstance(status, str)
+        or status not in _TERMINAL_STATUSES
+    ):
+        return None
+    return status
+
+
+async def _recorded_completion_status(
+    parent_id: str,
+    child: Conversation,
+    store: ConversationStore,
+) -> str | None:
+    for kind, label in (
+        ("task", "omnigent.claude_native.subagent_id"),
+        ("call", "omnigent.claude_native.tool_use_id"),
+    ):
+        native_id = child.labels.get(label)
+        if native_id:
+            status = await asyncio.to_thread(_completion_status, parent_id, kind, native_id, store)
+            if status:
+                return status
+    return None
+
+
 async def record_subagent_activity(
     child_id: str,
     phase: Literal["delegated", "returned"],
@@ -86,6 +150,14 @@ async def record_subagent_activity(
         if parent_id is not None and child.parent_conversation_id != parent_id:
             return
         parent_id = child.parent_conversation_id
+        if (
+            phase == "delegated"
+            and child.labels.get("omnigent.wrapper") == "codex-native-ui-subagent"
+            and not child.labels.get("omnigent.codex_native.agent_nickname")
+            and not child.labels.get("omnigent.codex_native.agent_role")
+        ):
+            # Codex registers the child before thread/resume supplies its name.
+            return
         if phase == "returned" and turn_id is None:
             latest = await asyncio.to_thread(store.list_items, child.id, limit=20, order="desc")
             turn_id = next(
@@ -122,24 +194,24 @@ async def record_subagent_activity(
                 type="response.output_item.done", item=persisted.to_api_dict()
             )
             session_stream.publish(parent_id, event.model_dump())
-        if phase == "delegated" and child.labels.get("omnigent.claude_native.subagent_id"):
+        if phase == "delegated" and any(
+            child.labels.get(label)
+            for label in (
+                "omnigent.claude_native.subagent_id",
+                "omnigent.claude_native.tool_use_id",
+            )
+        ):
             # A quick result may reach the parent before child discovery runs.
-            recent = await asyncio.to_thread(store.list_items, parent_id, limit=100, order="desc")
-            for previous in recent.data:
-                tasks, calls = _claude_completion_ids(previous)
-                completion_status = tasks.get(
-                    child.labels["omnigent.claude_native.subagent_id"]
-                ) or calls.get(child.labels.get("omnigent.claude_native.tool_use_id", ""))
-                if completion_status:
-                    await record_subagent_activity(
-                        child.id,
-                        "returned",
-                        store,
-                        parent_id=parent_id,
-                        turn_id=child.labels.get("omnigent.claude_native.tool_use_id") or child.id,
-                        status=completion_status,
-                    )
-                    break
+            completion_status = await _recorded_completion_status(parent_id, child, store)
+            if completion_status:
+                await record_subagent_activity(
+                    child.id,
+                    "returned",
+                    store,
+                    parent_id=parent_id,
+                    turn_id=child.labels.get("omnigent.claude_native.tool_use_id") or child.id,
+                    status=completion_status,
+                )
     except Exception:  # noqa: BLE001 — display metadata must not interrupt child delivery
         _logger.warning("Could not record subagent activity for %s", child_id, exc_info=True)
 
@@ -192,6 +264,12 @@ async def _record_claude_subagent_return(
     task_ids, call_ids = _claude_completion_ids(item)
     if not task_ids and not call_ids:
         return
+    markers = [
+        _completion_marker(kind, native_id, status)
+        for kind, completions in (("task", task_ids), ("call", call_ids))
+        for native_id, status in completions.items()
+    ]
+    await asyncio.to_thread(store.append, parent_id, markers)
     after: str | None = None
     while True:
         page = await asyncio.to_thread(
