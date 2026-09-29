@@ -1,8 +1,8 @@
 // Onboarding step 1: the hero landing. Without MDM presets: "Get started
 // locally" opens deployment-mode select and "Join your team" opens server
 // select. With MDM presets: "Join your team (<name>)" becomes a primary split
-// button (button + dropdown of preset servers) and "Get started locally" drops
-// to secondary. Rendered inside the card body below the animated panel.
+// button (button + dropdown of preset servers, "Show all servers…", "Add
+// server…") and "Get started locally" drops to secondary. Rendered inside the card body below the animated panel.
 
 import { ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -25,11 +25,14 @@ export function LandingStep({
   managedServers,
   onGetStarted,
   onJoinServer,
+  onAddServer,
   onJoinManaged,
 }: {
   managedServers: string[];
   onGetStarted: () => void;
   onJoinServer: () => void;
+  /** Open the add-server (URL input) view directly (preset dropdown). */
+  onAddServer: () => void;
   /** Join a specific preset server (the split button + its dropdown). */
   onJoinManaged: (url: string) => void;
 }) {
@@ -79,6 +82,7 @@ export function LandingStep({
                     otherwise unreachable from the MDM landing. */}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onSelect={onJoinServer}>Show all servers…</DropdownMenuItem>
+                <DropdownMenuItem onSelect={onAddServer}>Add server…</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

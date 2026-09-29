@@ -3008,12 +3008,16 @@ function registerIpc() {
 
   // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
   // var pins the selector on, so "Switch to legacy" can't take effect and the
-  // menu item is disabled.
+  // menu item is disabled. `connectedBefore` (returning user) reads the raw
+  // recents, which — unlike get-recent-servers — still count MDM presets.
   ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("get-setup-capabilities is only available to the setup page");
     }
-    return { v2Forced: serverSelectorV2EnvForced() };
+    return {
+      v2Forced: serverSelectorV2EnvForced(),
+      connectedBefore: normalizeRecentServers(loadSettings().recent_servers).length > 0,
+    };
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -3251,6 +3255,8 @@ function registerIpc() {
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
+      // start-local's own reuse test, so "Open" vs "Start Omnigent" matches it.
+      localServerRunning: (await omnigentCli.localServerHealthy()) !== null,
     };
   });
 

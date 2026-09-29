@@ -24,11 +24,15 @@ interface OmnigentSetup {
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
-  getSetupCapabilities?: () => Promise<{ v2Forced?: boolean }>;
+  getSetupCapabilities?: () => Promise<{ v2Forced?: boolean; connectedBefore?: boolean }>;
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   getColorScheme?: () => Promise<{ source: string; effective: "light" | "dark" } | null>;
   onColorScheme?: (cb: (theme: "light" | "dark") => void) => () => void;
-  getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
+  getCliStatus: () => Promise<{
+    installed?: boolean;
+    installSupported?: boolean;
+    localServerRunning?: boolean;
+  }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
   installCli?: () => Promise<{ ok?: boolean; error?: string; installed?: boolean }>;
@@ -65,9 +69,13 @@ function BridgeSetupApp() {
   const [initialUrl, setInitialUrl] = useState(failedUrl ?? DEFAULT_URL);
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
-  // Whether the `omnigent` CLI is installed — decides "Install" vs "Open" and
-  // the returning-user start step. Undefined until the probe resolves.
+  // Whether the `omnigent` CLI is installed — decides "Install" vs "Start"/"Open".
+  // Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
+  // Whether the local server is already up → local actions "Open" vs "Start".
+  const [localServerRunning, setLocalServerRunning] = useState(false);
+  // Has ever connected (returning user) — picks the welcome vs server-list start.
+  const [connectedBefore, setConnectedBefore] = useState(false);
   // Whether in-app install is available on this platform (macOS only). Off →
   // connect/local must never route through an install step.
   const [installSupported, setInstallSupported] = useState(false);
@@ -103,11 +111,15 @@ function BridgeSetupApp() {
     const cli = bridge.getCliStatus().then((status) => {
       setInstalled(status?.installed === true);
       setInstallSupported(status?.installSupported === true);
+      setLocalServerRunning(status?.localServerRunning === true);
     });
     // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
     // it too, so the legacy item isn't shown enabled before v2Forced resolves.
     const caps = bridge.getSetupCapabilities
-      ? bridge.getSetupCapabilities().then((c) => setV2Forced(c?.v2Forced === true))
+      ? bridge.getSetupCapabilities().then((c) => {
+          setV2Forced(c?.v2Forced === true);
+          setConnectedBefore(c?.connectedBefore === true);
+        })
       : Promise.resolve();
     // Seed the radio + `.dark` class from the shell's live theme so returning to
     // setup after the app set Dark shows Dark, not the "system" default.
@@ -141,6 +153,8 @@ function BridgeSetupApp() {
     recentServers,
     managedServers,
     installed,
+    connectedBefore,
+    localServerRunning,
     onConnect: async (url) => {
       // setServerUrl persists the URL and navigates the window to it; on success
       // the server's SPA takes over and this page goes away. A rejection (e.g.
