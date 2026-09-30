@@ -67,11 +67,6 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
-# ── Auth-enabled fixtures (per-module, matching the convention in
-#    test_sessions_permissions.py — these are redefined per test
-#    module rather than promoted to conftest) ──────────────────
-
-
 async def _create_session(
     client: httpx.AsyncClient,
     agent_id: str,

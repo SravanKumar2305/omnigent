@@ -61,9 +61,6 @@ def _seed_session(db_uri: str, *, with_agent: bool = False) -> str:
 pytestmark = pytest.mark.asyncio
 
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-
-
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 
