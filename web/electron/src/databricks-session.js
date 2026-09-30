@@ -23,6 +23,7 @@ const {
   cookieMatchesOrigin,
   isTransientRenewalError,
   IP_ACL_BLOCKED,
+  SESSION_TRANSPORT,
 } = require("./databricks-auth");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
@@ -228,8 +229,10 @@ async function mintSessionCookie(
           reject(error);
         } else resolve(code);
       };
-      const abort = (message) => {
-        finish(new Error(message));
+      const transportError = (message) =>
+        Object.assign(new Error(message), { errorCode: SESSION_TRANSPORT });
+      const abort = (error) => {
+        finish(error);
         request.abort();
       };
       const onAbort = () => {
@@ -237,7 +240,7 @@ async function mintSessionCookie(
         request.abort();
       };
       const timer = setTimeoutFn(
-        () => abort("Databricks session creation timed out"),
+        () => abort(transportError("Databricks session creation timed out")),
         NETWORK_TIMEOUT_MS,
       );
       request.setHeader("Authorization", `Bearer ${accessToken}`);
@@ -261,7 +264,9 @@ async function mintSessionCookie(
         // Follow only the intended app destination so Chromium commits Set-Cookie.
         if (!accepted) {
           abort(
-            "Databricks session creation redirected to authentication or an unexpected destination",
+            new Error(
+              "Databricks session creation redirected to authentication or an unexpected destination",
+            ),
           );
           return;
         }
@@ -287,9 +292,9 @@ async function mintSessionCookie(
         });
         response.on("end", () => finish(null, response.statusCode));
         response.on("error", (error) => finish(error));
-        response.on("aborted", () => finish(new Error("Databricks session response aborted")));
+        response.on("aborted", () => finish(transportError("Databricks session response aborted")));
         response.on("close", () =>
-          finish(new Error("Databricks session response closed before completion")),
+          finish(transportError("Databricks session response closed before completion")),
         );
       });
       // ClientRequest's Writable closes after end(), before the response arrives.

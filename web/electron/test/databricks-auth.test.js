@@ -10,6 +10,7 @@ const {
   isDatabricksLoginUrl,
   isTransientRenewalError,
   IP_ACL_BLOCKED,
+  SESSION_TRANSPORT,
   createDatabricksAuth,
 } = require("../src/databricks-auth");
 
@@ -417,20 +418,21 @@ describe("Databricks browser session lifecycle", () => {
 });
 
 describe("transient renewal error classification", () => {
-  it("retries only network, timeout, server-side, and IP access list failures", async () => {
-    const refused = await fetch("http://127.0.0.1:1/").catch((error) => error);
-    const timedOut = await fetch("http://127.0.0.1:1/", { signal: AbortSignal.timeout(0) }).catch(
-      (error) => error,
-    );
+  it("retries only network, timeout, server-side, and IP access list failures", () => {
+    // The shapes fetch rejects with for a refused connection and an AbortSignal.timeout.
+    const refused = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }),
+    });
+    const timedOut = new DOMException("The operation was aborted due to timeout", "TimeoutError");
     const failure = (message, props) => Object.assign(new Error(message), props);
     for (const [error, transient] of [
       [refused, true],
       [timedOut, true],
       [new TypeError("fetch failed"), true],
       [new Error("net::ERR_NAME_NOT_RESOLVED"), true],
-      [new Error("Databricks session creation timed out"), true],
-      [new Error("Databricks session response aborted"), true],
-      [new Error("Databricks session response closed before completion"), true],
+      [failure("Databricks session creation timed out", { errorCode: SESSION_TRANSPORT }), true],
+      [failure("Databricks session response aborted", { errorCode: SESSION_TRANSPORT }), true],
+      [new Error("Databricks session response aborted"), false],
       [failure("token endpoint 503", { status: 503 }), true],
       [failure("token endpoint 429", { status: 429 }), true],
       [failure("HTTP 403", { status: 403, errorCode: IP_ACL_BLOCKED }), true],

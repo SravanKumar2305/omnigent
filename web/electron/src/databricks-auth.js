@@ -58,25 +58,20 @@ const SESSION_REJECTED = "SESSION_REJECTED";
 const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
 const sessionRejected = (message) =>
   Object.assign(new Error(message), { errorCode: SESSION_REJECTED });
-// Must match the transport errors thrown by databricks-session.js.
-const SESSION_TRANSPORT_ERRORS = new Set([
-  "Databricks session creation timed out",
-  "Databricks session response aborted",
-  "Databricks session response closed before completion",
-]);
+// Session-create timed out or its response was cut off (databricks-session.js).
+const SESSION_TRANSPORT = "SESSION_TRANSPORT";
 
 /** Whether a renewal failure is worth retrying: no response, HTTP 5xx/429, or an IP ACL block. */
 function isTransientRenewalError(error) {
   if (!error || typeof error !== "object") return false;
-  if (error.errorCode === IP_ACL_BLOCKED) return true;
+  if (error.errorCode === IP_ACL_BLOCKED || error.errorCode === SESSION_TRANSPORT) return true;
   const { status } = error;
   if (status != null) return status === 429 || (status >= 500 && status <= 599);
   const message = typeof error.message === "string" ? error.message : "";
   return (
     error.name === "TimeoutError" ||
     (error.name === "TypeError" && (message === "fetch failed" || message === "terminated")) ||
-    message.startsWith("net::ERR_") ||
-    SESSION_TRANSPORT_ERRORS.has(message)
+    message.startsWith("net::ERR_")
   );
 }
 
@@ -345,5 +340,6 @@ module.exports = {
   isTransientRenewalError,
   SESSION_REJECTED,
   IP_ACL_BLOCKED,
+  SESSION_TRANSPORT,
   createDatabricksAuth,
 };

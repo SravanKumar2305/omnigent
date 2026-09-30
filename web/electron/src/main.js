@@ -745,6 +745,12 @@ function shownSetupParams(win) {
   return isSetupPageUrl(url) ? new URL(url).searchParams : null;
 }
 
+/** A failed background reconnect keeps an identical setup page, so the form isn't reset. */
+function showsSameRetryPage(win, params) {
+  const shown = !connectionAttempts.get(win)?.requestId && shownSetupParams(win);
+  return Boolean(shown) && [...params].every(([key, value]) => shown.get(key) === value);
+}
+
 /** Arm the next silent reconnect for a transient failure; false once the schedule runs out. */
 function scheduleReconnect(win, serverUrl, returnUrl) {
   const previous = reconnects.get(win);
@@ -828,9 +834,7 @@ function showDatabricksAuthRequired(win, serverUrl, error, { returnUrl } = {}) {
   const params = new URLSearchParams({ error: message, url: serverUrl });
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   if (retrying) params.set("reconnect", "1");
-  // A failed background reconnect keeps an identical page, so the form isn't reset.
-  const shown = retrying && !connectionAttempts.get(win)?.requestId && shownSetupParams(win);
-  const unchanged = shown && [...params].every(([key, value]) => shown.get(key) === value);
+  const unchanged = retrying && showsSameRetryPage(win, params);
   databricksAuth?.rejectConnection(win);
   pinWindow(win, null);
   setWindowServerUrl(win, null);
@@ -1746,7 +1750,8 @@ function registerNavigationFallbacks(win) {
       if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
       if (retrying) params.set("reconnect", "1");
       pinWindow(win, null); // back on the setup page → no trusted origin
-      void loadSetupPage(win, params.toString());
+      if (!(retrying && showsSameRetryPage(win, params)))
+        void loadSetupPage(win, params.toString());
     },
   );
 
@@ -1762,11 +1767,24 @@ function registerNavigationFallbacks(win) {
     const status = httpStatusText
       ? `${httpResponseCode} ${httpStatusText}`
       : `HTTP ${httpResponseCode}`;
+    let retrying = false;
+    const overloaded =
+      httpResponseCode === 429 || (httpResponseCode >= 500 && httpResponseCode <= 599);
+    if (overloaded && state.serverUrl && usesBrowserAuth(pinnedOrigin(win))) {
+      // The workspace may be restarting or shedding load: keep retrying from setup.
+      console.warn("[omnigent] databricks auth: page load failed", {
+        origin: failedOrigin,
+        status: httpResponseCode,
+      });
+      retrying = scheduleReconnect(win, state.serverUrl, url);
+    }
+    if (!retrying) cancelReconnect(win);
     const params = new URLSearchParams({
-      error: status,
+      error: retrying ? `${status}. Retrying automatically…` : status,
       url: state.serverUrl ?? url ?? "",
     });
     if (state.ephemeral) params.set("ephemeral", "1");
+    if (retrying) params.set("reconnect", "1");
     pinWindow(win, null);
     void loadSetupPage(win, params.toString());
   });

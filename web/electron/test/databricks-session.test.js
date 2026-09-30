@@ -364,7 +364,10 @@ describe("Databricks cookie minting", () => {
       },
       clearTimeoutFn() {},
     });
-    const rejected = assert.rejects(promise, /timed out/);
+    const rejected = assert.rejects(promise, {
+      message: /timed out/,
+      errorCode: "SESSION_TRANSPORT",
+    });
     await timerReady;
     await new Promise((resolve) => {
       setImmediate(resolve);
@@ -388,7 +391,11 @@ describe("Databricks cookie minting", () => {
   });
   it("rejects a response that errors, aborts, or closes before end", async () => {
     await Promise.all(
-      ["error", "aborted", "close"].map((event) => {
+      [
+        ["error", undefined],
+        ["aborted", "SESSION_TRANSPORT"],
+        ["close", "SESSION_TRANSPORT"],
+      ].map(([event, errorCode]) => {
         const h = harness({
           respond(req) {
             const res = new EventEmitter();
@@ -396,10 +403,11 @@ describe("Databricks cookie minting", () => {
             res.emit(event, new Error("response failed"));
           },
         });
-        return assert.rejects(
-          h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
-          /response failed|response aborted|response closed/,
-        );
+        return assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
+          assert.match(error.message, /response failed|response aborted|response closed/);
+          assert.equal(error.errorCode, errorCode);
+          return true;
+        });
       }),
     );
   });

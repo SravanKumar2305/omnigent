@@ -656,35 +656,9 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
-  it("keeps the sign-in wording for a retried server error", async (t) => {
-    const shown = [];
-    for (const retries of [[20], []]) {
-      const h = loadNavigationHarness({
-        serverUrl: workspace,
-        databricksMode: "browser",
-        internalFeatures: true,
-        ensureSession: async () => {
-          throw Object.assign(new Error("HTTP 503"), { status: 503 });
-        },
-      });
-      t.after(h.cleanup);
-      h.api.setReconnectDelaysMs(retries);
-      // oxlint-disable-next-line no-await-in-loop
-      await assert.rejects(h.api.loadServerUrl(h.win, workspace));
-      // oxlint-disable-next-line no-await-in-loop
-      await tick();
-      h.setUrl("about:blank");
-      const params = new URLSearchParams(h.calls.loadFile[0][1].search);
-      shown.push([params.get("error"), params.get("reconnect")]);
-    }
-    assert.deepEqual(shown, [
-      ["Couldn't sign in to Databricks. Retrying automatically…", "1"],
-      ["Couldn't sign in to Databricks. Please try again.", null],
-    ]);
-  });
-
   const offline = () => new TypeError("fetch failed");
   const ipAclBlocked = () => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
+  const serverError = () => Object.assign(new Error("HTTP 503"), { status: 503 });
   const [cant, couldnt, blocked] = [
     "Can't reach Databricks.",
     "Couldn't reach Databricks.",
@@ -693,14 +667,19 @@ describe("Databricks auth mode wiring", () => {
   const vpn = "Check that you're connected to the VPN";
   const network = "Check your network connection";
   const allowed = "Connect from a network the workspace allows";
+  const retry = (message) => `${message}. Retrying automatically…`;
+  const thenConnect = (message) => `${message}, then click Connect.`;
+  const signIn = "Couldn't sign in to Databricks";
   // [managed device, renewal failure (null: unreachable page load), retrying, final message]
   for (const [internalFeatures, failure, retrying, final] of [
-    [true, offline, `${cant} ${vpn}`, `${couldnt} ${vpn}`],
-    [false, offline, `${cant} ${network}`, `${couldnt} ${network}`],
-    [true, ipAclBlocked, `${blocked} ${vpn}`, `${blocked} ${vpn}`],
-    [false, ipAclBlocked, `${blocked} ${allowed}`, `${blocked} ${allowed}`],
-    [true, null, `${cant} ${vpn}`, `${couldnt} ${vpn}`],
-    [false, null, `${cant} ${network}`, `${couldnt} ${network}`],
+    [true, offline, retry(`${cant} ${vpn}`), thenConnect(`${couldnt} ${vpn}`)],
+    [false, offline, retry(`${cant} ${network}`), thenConnect(`${couldnt} ${network}`)],
+    [true, ipAclBlocked, retry(`${blocked} ${vpn}`), thenConnect(`${blocked} ${vpn}`)],
+    [false, ipAclBlocked, retry(`${blocked} ${allowed}`), thenConnect(`${blocked} ${allowed}`)],
+    [true, null, retry(`${cant} ${vpn}`), thenConnect(`${couldnt} ${vpn}`)],
+    [false, null, retry(`${cant} ${network}`), thenConnect(`${couldnt} ${network}`)],
+    // The server answered, so there's no network or VPN advice.
+    [true, serverError, retry(signIn), `${signIn}. Please try again.`],
   ]) {
     it(`shows "${retrying}" while retrying, then "${final}"`, async (t) => {
       const shown = [];
@@ -728,8 +707,8 @@ describe("Databricks auth mode wiring", () => {
         shown.push([params.get("error"), params.get("reconnect")]);
       }
       assert.deepEqual(shown, [
-        [`${retrying}. Retrying automatically…`, "1"],
-        [`${final}, then click Connect.`, null],
+        [retrying, "1"],
+        [final, null],
       ]);
     });
   }
@@ -1869,6 +1848,86 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(harness.calls.loadFile.length, 1);
   });
 
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const page = `${workspace}/c/conv_1`;
+  const wait = (ms) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  function workspaceHarness(t, delays, options = {}) {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ...options,
+    });
+    t.after(h.cleanup);
+    h.api.setReconnectDelaysMs(delays);
+    return h;
+  }
+
+  for (const [code, text] of [
+    [429, "Too Many Requests"],
+    [503, "Service Unavailable"],
+  ]) {
+    it(`retries a Databricks workspace's ${code} from setup, until retries run out`, async (t) => {
+      const shown = [];
+      // An empty schedule means retries ran out.
+      for (const retries of [[20], []]) {
+        const h = workspaceHarness(t, retries);
+        h.emit("did-navigate", page, code, text);
+        // oxlint-disable-next-line no-await-in-loop
+        await flush();
+        const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+        shown.push([params.get("error"), params.get("url"), params.get("reconnect")]);
+        // Leaving the retrying page stops the pending reconnect.
+        h.setUrl("about:blank");
+      }
+      assert.deepEqual(shown, [
+        [`${code} ${text}. Retrying automatically…`, workspace, "1"],
+        [`${code} ${text}`, workspace, null],
+      ]);
+    });
+  }
+
+  it("reopens the page after a 503 during a reconnect", async (t) => {
+    let loads = 0;
+    const h = workspaceHarness(t, [20, 20], {
+      loadURL: async (url) => {
+        if (loads++ === 0) h.emit("did-navigate", url, 503, "Service Unavailable");
+      },
+    });
+    h.emit("did-navigate", page, 503, "Service Unavailable");
+    await wait(100);
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.equal(h.calls.loadFile.length, 2);
+    assert.equal(
+      new URLSearchParams(h.calls.loadFile[1][1].search).get("error"),
+      "503 Service Unavailable. Retrying automatically…",
+    );
+    assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
+    assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
+  });
+
+  it("keeps the plain fallback for a Databricks 404 and other servers' 503", async (t) => {
+    const notFound = workspaceHarness(t, [20]);
+    notFound.emit("did-navigate", page, 404, "Not Found");
+    const other = loadNavigationHarness();
+    t.after(other.cleanup);
+    other.api.setReconnectDelaysMs([20]);
+    other.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Service Unavailable");
+    await wait(60);
+    for (const [h, error] of [
+      [notFound, "404 Not Found"],
+      [other, "503 Service Unavailable"],
+    ]) {
+      assert.equal(h.calls.loadFile.length, 1);
+      const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+      assert.equal(params.get("error"), error);
+      assert.equal(params.get("reconnect"), null);
+      assert.deepEqual(h.calls.loadURL, []);
+    }
+  });
+
   it("keeps the network-error fallback and ignores ERR_ABORTED", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
@@ -1922,6 +1981,9 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
     const h = browserHarness(t, [25, 25], {
       loadURL: async (url) => {
         if (loads++ > 0) return;
+        // A failed navigation never commits: the window still shows the retrying setup page.
+        const [file, { search }] = h.calls.loadFile.at(-1);
+        h.setUrl(`file://${file}?${search}`);
         failLoad(h, url);
         throw new Error("ERR_NAME_NOT_RESOLVED (-105) loading url");
       },
@@ -1935,9 +1997,10 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
     });
     assert.equal(h.api.windows.get(h.win).origin, null);
     await wait(100);
-    // The first silent retry failed to load as well; the second reopened the page.
+    // The first silent retry failed to load as well, without reloading the setup page;
+    // the second reopened the page.
     assert.deepEqual(h.calls.loadURL, [[page], [page]]);
-    assert.equal(h.calls.loadFile.length, 2);
+    assert.equal(h.calls.loadFile.length, 1);
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
     assert.equal(h.api.windows.get(h.win).origin, origin);
   });
