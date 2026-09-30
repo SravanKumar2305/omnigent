@@ -1548,6 +1548,7 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
 @pytest.mark.asyncio
 async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     ``Stop`` → idle (the authoritative turn-end); ``UserPromptSubmit`` ignored.
@@ -1559,6 +1560,7 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     only) ``external_session_status`` POST must be the ``idle`` from ``Stop``.
     A ``running`` arriving first would mean ``UserPromptSubmit`` still maps.
     """
+    caplog.set_level("INFO", logger="omnigent.harnesses.claude_native.forwarder")
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -1572,7 +1574,15 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     )
     record_hook_event(
         bridge_dir,
-        {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"},
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session",
+            "prompt": "private prompt",
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "UserPromptSubmit", "session_id": "subagent-session"},
     )
     record_hook_event(
         bridge_dir,
@@ -1609,6 +1619,18 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
         "type": "external_session_status",
         "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
     }
+
+    submitted = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_prompt_submit_hook"
+    ]
+    assert len(submitted) == 1
+    assert submitted[0].session_id == "conv_abc"
+    assert submitted[0].attributes["claude_session_id"] == "claude-session"
+    assert submitted[0].attributes["hook_cursor"] == 2
+    assert "private prompt" not in caplog.text
+    assert "private prompt" not in str(submitted[0].attributes)
 
 
 @pytest.mark.asyncio

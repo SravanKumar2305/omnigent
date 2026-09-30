@@ -60,13 +60,14 @@ from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, TypeVar, cast
 from urllib import request
 
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.debug_logging import current_session_id, debug_event
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
@@ -3950,6 +3951,118 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+@dataclass
+class _PromptDeliveryTrace:
+    delivery_id: str
+    session_id: str | None
+    started: float
+    stage: str = "lock_wait"
+    attempt: int = 0
+    verification: str = "not_started"
+
+
+_prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
+    "claude_prompt_delivery_trace", default=None
+)
+
+
+def _delivery_event(event: str, *, level: int = logging.INFO, **attributes: object) -> None:
+    """Emit content-free diagnostics to both the local log and structured sink."""
+    trace = _prompt_delivery_trace.get()
+    if trace is None:
+        return
+    fields = {
+        "delivery_id": trace.delivery_id,
+        "stage": trace.stage,
+        "attempt": trace.attempt,
+        "elapsed_ms": round((time.monotonic() - trace.started) * 1000),
+        **attributes,
+    }
+    extra = debug_event(event, session_id=trace.session_id)
+    extra["attributes"] = fields
+    _logger.log(
+        level,
+        "%s %s",
+        event,
+        json.dumps(fields, sort_keys=True),
+        extra=extra,
+    )
+
+
+def _delivery_stage(stage: str) -> None:
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        trace.stage = stage
+        _delivery_event("claude_native_delivery_stage")
+
+
+def _trace_user_message_delivery(function: _InjectionFunction) -> _InjectionFunction:
+    """Correlate startup, paste attempts and failures without recording user text."""
+
+    @functools.wraps(function)
+    def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
+        trace = _PromptDeliveryTrace(
+            delivery_id=secrets.token_hex(8),
+            session_id=current_session_id() or read_active_session_id(bridge_dir),
+            started=time.monotonic(),
+        )
+        token = _prompt_delivery_trace.set(trace)
+        normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+        try:
+            _delivery_event(
+                "claude_native_delivery_started",
+                content_bytes=len(content.encode("utf-8")),
+                newline_count=normalized.count("\n"),
+                leading_blank_line=bool(normalized) and not normalized.split("\n", 1)[0].strip(),
+            )
+            result = function(bridge_dir, content=content, **kwargs)
+        except BaseException as exc:
+            _delivery_event(
+                "claude_native_delivery_finished",
+                level=logging.WARNING,
+                outcome="interrupted" if isinstance(exc, ClaudeInjectionCancelled) else "error",
+                error_type=type(exc).__name__,
+                verification=trace.verification,
+            )
+            raise
+        else:
+            _delivery_event(
+                "claude_native_delivery_finished",
+                outcome="returned",
+                verification=trace.verification,
+            )
+            return result
+        finally:
+            _prompt_delivery_trace.reset(token)
+
+    return cast(_InjectionFunction, wrapped)
+
+
+class _DraftObservation(TypedDict):
+    capture_empty: bool
+    prompt_glyph_visible: bool
+    needle_visible_below_prompt: bool
+    pane_rows: int
+    pane_max_columns: int
+
+
+def _draft_observation(pane: str, needle: str) -> _DraftObservation:
+    """Summarize the last prompt row without retaining terminal or prompt text."""
+    lines = pane.splitlines()
+    prompt_rows = [index for index, line in enumerate(lines) if _CLAUDE_PROMPT_GLYPH in line]
+    last_prompt = prompt_rows[-1] if prompt_rows else None
+    return {
+        "capture_empty": not pane.strip(),
+        "prompt_glyph_visible": last_prompt is not None,
+        "needle_visible_below_prompt": bool(needle)
+        and last_prompt is not None
+        and needle in "\n".join(lines[last_prompt + 1 :]),
+        "pane_rows": len(lines),
+        "pane_max_columns": max((len(line) for line in lines), default=0),
+    }
+
+
+@_trace_user_message_delivery
 @_serialize_bridge_injection
 def inject_user_message(
     bridge_dir: Path,
@@ -4015,7 +4128,9 @@ def inject_user_message(
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
     """
+    _delivery_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _delivery_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
@@ -4023,6 +4138,7 @@ def inject_user_message(
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
+    _delivery_stage("waiting_for_prompt")
     _wait_for_claude_prompt_ready(
         info["socket_path"],
         info["tmux_target"],
@@ -4108,6 +4224,11 @@ def _paste_and_submit(
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        trace.attempt += 1
+        trace.verification = "not_started"
+    _delivery_stage("pasting")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
@@ -4158,20 +4279,46 @@ def _paste_and_submit(
     # when the draft never becomes identifiable (e.g. whitespace-only
     # first line, custom statusline containing the glyph), fall through
     # after the timeout and submit blind, matching the old behavior.
+    _delivery_stage("waiting_for_draft")
     draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    paste_wait_started = time.monotonic()
+    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
+        if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    _delivery_event(
+        "claude_native_draft_observed",
+        draft_seen=draft_seen,
+        needle_available=bool(needle),
+        wait_ms=round((time.monotonic() - paste_wait_started) * 1000),
+        polls=polls,
+        empty_captures=empty_captures,
+        **_draft_observation(pane, needle),
+    )
     time.sleep(_PASTE_SETTLE_S)
+    _delivery_stage("submitting")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _delivery_event("claude_native_submit_sent", draft_seen=draft_seen)
     if not draft_seen:
+        if trace is not None:
+            trace.verification = "unverified"
+        _delivery_event(
+            "claude_native_submit_unverified",
+            level=logging.WARNING,
+            reason="draft_not_observed",
+        )
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
         return
@@ -4181,6 +4328,7 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
+    _delivery_stage("verifying_submit")
     if _verify_submit_accepted(
         socket_path,
         tmux_target,
@@ -4228,10 +4376,32 @@ def _verify_submit_accepted(
     last_enter = start
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
     warned = False
+    retries = 0
+    polls = 0
+    pane = ""
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
         if not _draft_in_input_box(pane, needle):
+            observation = _draft_observation(pane, needle)
+            verification = (
+                "inconclusive_capture"
+                if observation["capture_empty"] or not observation["prompt_glyph_visible"]
+                else "draft_absent"
+            )
+            trace = _prompt_delivery_trace.get()
+            if trace is not None:
+                trace.verification = verification
+            _delivery_event(
+                "claude_native_submit_verification",
+                level=logging.WARNING if verification == "inconclusive_capture" else logging.INFO,
+                verification=verification,
+                wait_ms=round((time.monotonic() - start) * 1000),
+                retries=retries,
+                polls=polls,
+                **observation,
+            )
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4252,8 +4422,21 @@ def _verify_submit_accepted(
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            retries += 1
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        trace.verification = "draft_still_present"
+    _delivery_event(
+        "claude_native_submit_verification",
+        level=logging.WARNING,
+        verification="draft_still_present",
+        wait_ms=round((time.monotonic() - start) * 1000),
+        retries=retries,
+        polls=polls,
+        **_draft_observation(pane, needle),
+    )
     return False
 
 
