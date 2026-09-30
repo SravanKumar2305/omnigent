@@ -1,15 +1,12 @@
+import { renderSidebar } from "./sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "./sidebarMockHelpers";
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Behaviour tests for the mobile sidebar drawer shape: it stops short of the
 // right edge so a strip of the chat stays visible, tapping that strip dismisses
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
 // Settings float at the top and bottom of the drawer.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -26,27 +23,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
 function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => conversationPage(conversations));
-}
-
-function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: string } = {}) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[props.route ?? "/"]}>
-            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
 }
 
 beforeEach(() => {

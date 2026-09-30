@@ -1,19 +1,17 @@
+import { conversationPage } from "./sidebarMockHelpers";
+import { renderSidebar } from "./sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for shift-click range selection in the sidebar's multi-session mode.
 // Covers the pure range computation helper and the integrated click behavior.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
-import { computeShiftSelectRange, Sidebar } from "./Sidebar";
+import { computeShiftSelectRange } from "./Sidebar";
 
 describe("computeShiftSelectRange", () => {
   const ids = ["a", "b", "c", "d", "e"];
@@ -125,43 +123,7 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
 
 function mockConversations(convs: Conversation[]) {
   conversationsRef.current = convs;
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: convs,
-              first_id: convs[0]?.id ?? null,
-              last_id: convs.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(convs));
 }
 
 beforeEach(() => {

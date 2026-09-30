@@ -1,3 +1,4 @@
+import { conversationPage } from "./sidebarMockHelpers";
 import { renderSidebar } from "./sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -26,12 +27,6 @@ vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
-    useStopAndDeleteConversation: () => ({
-      mutate: vi.fn(),
-      reset: vi.fn(),
-      isPending: false,
-      isError: false,
-    }),
     useBulkDeleteConversations: () => mocks.bulkDelete,
   };
 });
@@ -69,26 +64,8 @@ const PLAIN: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const dataResult = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
-  useConvMock.mockImplementation(() => dataResult);
+  const result = conversationPage(conversations);
+  useConvMock.mockImplementation(() => result);
 }
 
 /** Enter selection mode and select every row, then open the delete modal. */

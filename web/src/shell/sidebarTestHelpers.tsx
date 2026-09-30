@@ -7,14 +7,16 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { Sidebar } from "./Sidebar";
 
-export function renderSidebar() {
+export function renderSidebar(
+  props: { open?: boolean; onClose?: () => void; route?: string } = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <SidebarDataProvider>
         <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open={true} onClose={vi.fn()} />
+          <MemoryRouter initialEntries={[props.route ?? "/"]}>
+            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>

@@ -1,3 +1,4 @@
+import { conversationPage } from "./sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -35,12 +36,6 @@ vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
-    useStopAndDeleteConversation: () => ({
-      mutate: vi.fn(),
-      reset: vi.fn(),
-      isPending: false,
-      isError: false,
-    }),
     useArchiveConversation: () => mocks.archive,
     useStopSession: () => mocks.stop,
   };
@@ -67,28 +62,8 @@ const CONV: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const withData = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
-  // The sidebar fetches a single undifferentiated session list, so the
-  // mock returns the same data for the one query the component issues.
-  useConvMock.mockImplementation(() => withData);
+  const result = conversationPage(conversations);
+  useConvMock.mockImplementation(() => result);
 }
 
 function renderSidebar() {

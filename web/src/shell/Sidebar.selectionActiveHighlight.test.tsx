@@ -23,7 +23,6 @@ vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
-    useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));

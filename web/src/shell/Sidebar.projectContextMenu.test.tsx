@@ -1,11 +1,9 @@
+import { conversationPage } from "./sidebarMockHelpers";
+import { renderSidebar } from "./sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 
 const PROJECT_NAME = "Sprint 42";
 const PROJECT_ID = "p_sprint42";
@@ -33,13 +31,6 @@ vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
-    useStopAndDeleteConversation: () => ({
-      mutate: vi.fn(),
-      reset: vi.fn(),
-      isPending: false,
-      isError: false,
-      variables: undefined,
-    }),
     useProjects: () => ({ data: [{ id: PROJECT_ID, name: PROJECT_NAME }] }),
     useProjectSessions: () => ({
       data: undefined,
@@ -70,7 +61,6 @@ vi.mock("./ProjectSettingsDialog", () => ({
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConversationsMock = vi.mocked(useConversations);
 
@@ -87,41 +77,8 @@ const FILED_CONVERSATION: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const result = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
+  const result = conversationPage(conversations);
   useConversationsMock.mockImplementation(() => result);
-}
-
-function renderSidebar() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={client}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
 }
 
 function folderHeader(): HTMLElement {

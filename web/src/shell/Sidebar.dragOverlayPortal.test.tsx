@@ -1,8 +1,8 @@
+import { renderSidebar } from "./sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "./sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // The session-drag preview (dnd-kit DragOverlay) must render in a portal under
 // <body>, never inline inside the sidebar <aside>. The aside always carries a
 // CSS translate (the mobile slide-in), which makes it the containing block for
@@ -10,10 +10,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // coordinates against the aside's box and drifts away from the cursor whenever
 // the aside sits off (0,0), e.g. while it peeks as a floating card.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -53,27 +50,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations, useProjects } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
 function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => conversationPage(conversations));
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
 }
 
 /** Activate a real dnd-kit drag on a session row: press, then travel past the

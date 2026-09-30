@@ -5,8 +5,13 @@ import type { Conversation, useConversations } from "@/hooks/useConversations";
 export function conversationHooksMock() {
   return {
     useConversations: vi.fn(),
-    useConnectedConversations: () => [],
-    useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
+    useStopAndDeleteConversation: () => ({
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      isPending: false,
+      isError: false,
+      variables: undefined,
+    }),
     usePinnedConversations: () => ({
       data: { conversations: [], filterHonored: true },
       isSuccess: true,
@@ -62,7 +67,7 @@ export function conversationPage(
     last_id: conversations.at(-1)?.id ?? null,
   },
 ) {
-  return {
+  const result = {
     data: {
       pages: [{ data: conversations, ...bounds, has_more: false }],
       pageParams: [undefined],
@@ -73,5 +78,6 @@ export function conversationPage(
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
+  } satisfies Partial<ReturnType<typeof useConversations>>;
+  return result as unknown as ReturnType<typeof useConversations>;
 }

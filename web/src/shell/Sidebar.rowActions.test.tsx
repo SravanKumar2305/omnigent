@@ -79,13 +79,6 @@ vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
-    useStopAndDeleteConversation: () => ({
-      mutate: vi.fn(),
-      reset: vi.fn(),
-      isPending: false,
-      isError: false,
-      variables: undefined,
-    }),
     usePinnedConversations: () => {
       const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
       const idSet = new Set(ids);
