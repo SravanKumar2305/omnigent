@@ -2,10 +2,12 @@
 
 import copy
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -636,3 +638,124 @@ def test_invalid_paginated_artifact_response_fails_cleanly(monkeypatch, capsys, 
     )
     assert cycle.main() == 1
     assert "Invalid paginated response for repos/o/r/actions/artifacts?" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "valid",
+        "wrong_pr",
+        "wrong_head",
+        "other_comment",
+        "other_repository",
+        "invalid_url",
+        "missing_comment",
+        "human",
+        "nonzero",
+        "extra_finding",
+        "no_receipt",
+        "failed_run",
+        "untrusted_run",
+        "expired",
+        "stale_artifact",
+    ],
+)
+def test_zero_findings_requires_matching_trusted_receipt(monkeypatch, mutation):
+    api = Github()
+    api.artifacts[0]["id"] = 123
+    api.comments[1]["body"] = (
+        "<!-- ocr-summary -->\n✅ **OpenCodeReview**: "
+        "Review complete: 0 finding(s) across 4 selected item(s)."
+    )
+    receipt = {
+        "pr": 7,
+        "head": "a" * 40,
+        "summary_url": "https://github.com/o/r/pull/7#issuecomment-2",
+    }
+    if mutation == "wrong_pr":
+        receipt["pr"] = 8
+    elif mutation == "wrong_head":
+        receipt["head"] = "b" * 40
+    elif mutation == "other_comment":
+        receipt["summary_url"] = "https://github.com/o/r/pull/7#issuecomment-99"
+    elif mutation == "other_repository":
+        receipt["summary_url"] = "https://github.com/other/repo/pull/7#issuecomment-2"
+    elif mutation == "invalid_url":
+        receipt["summary_url"] = []
+    elif mutation == "missing_comment":
+        api.comments.pop(1)
+    elif mutation == "human":
+        api.comments[1]["user"]["login"] = "maintainer"
+    elif mutation == "nonzero":
+        api.comments[1]["body"] = api.comments[1]["body"].replace("0 finding", "1 finding")
+    elif mutation == "extra_finding":
+        api.comments[1]["body"] += "\nBlocking: still loses data."
+    elif mutation == "no_receipt":
+        api.artifacts.clear()
+    elif mutation == "failed_run":
+        api.run["conclusion"] = "failure"
+    elif mutation == "untrusted_run":
+        api.run["head_branch"] = "untrusted"
+    elif mutation == "expired":
+        api.artifacts[0]["expired"] = True
+    elif mutation == "stale_artifact":
+        api.artifacts[0]["name"] = "ocr-completed-7-" + "b" * 40
+    downloads = []
+
+    def read(repository, artifact_id):
+        downloads.append((repository, artifact_id))
+        return receipt
+
+    monkeypatch.setattr(cycle, "ocr_receipt", read)
+    state = cycle.snapshot("o/r", 7, api)
+    assert state["completed"]["ocr"] == (mutation == "valid")
+    if mutation == "valid":
+        assert downloads == [("o/r", 123)]
+        result = handoff(state)
+        result["review_cycle"]["dispositions"][1].update(
+            status="not_needed", reason="OCR reported zero findings on this commit."
+        )
+        cycle.validate(state, result)
+        # A clean OCR review does not excuse unrelated human or inline findings.
+        result["review_cycle"]["dispositions"].pop()
+        with pytest.raises(RuntimeError, match="needs an evidenced disposition"):
+            cycle.validate(state, result)
+    elif mutation not in {
+        "wrong_pr",
+        "wrong_head",
+        "other_comment",
+        "other_repository",
+        "invalid_url",
+    }:
+        assert downloads == []
+
+
+@pytest.mark.parametrize(
+    "payload", ["valid", "bad_zip", "missing_file", "bad_json", "list", "oversized", "http_error"]
+)
+def test_download_ocr_completion_receipt(monkeypatch, payload):
+    expected = {"pr": 7, "head": "a" * 40, "summary_url": "summary-url"}
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as bundle:
+        content = {"bad_json": "{", "list": "[]", "oversized": " " * 65537}.get(
+            payload, json.dumps(expected)
+        )
+        bundle.writestr(
+            "other.json" if payload == "missing_file" else "ocr-completion.json", content
+        )
+
+    def run(args, **kwargs):
+        assert args == ["gh", "api", "repos/o/r/actions/artifacts/123/zip"]
+        assert kwargs == {"check": True, "capture_output": True, "timeout": 120}
+        if payload == "http_error":
+            raise subprocess.CalledProcessError(1, args, stderr=b"HTTP 403")
+        return subprocess.CompletedProcess(
+            args, 0, b"invalid" if payload == "bad_zip" else archive.getvalue()
+        )
+
+    monkeypatch.setattr(cycle.subprocess, "run", run)
+    if payload == "valid":
+        assert cycle.ocr_receipt("o/r", 123) == expected
+    else:
+        with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError)):
+            cycle.ocr_receipt("o/r", 123)

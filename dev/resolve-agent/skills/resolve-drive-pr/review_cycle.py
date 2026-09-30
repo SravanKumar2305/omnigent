@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import re
 import subprocess
 from pathlib import Path
 from urllib.parse import urlencode
+from zipfile import BadZipFile, ZipFile
 
 REVIEWERS = {"polly": "polly-review.yml", "ocr": "open-code-review.yml"}
 REVIEW_BOTS = {"github-actions[bot]", "omnigent-ci[bot]"}
@@ -82,9 +84,9 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
         "artifacts",
     )
     if not artifacts:
-        return set()
+        return {}
     workflow = api_object(f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}", request)
-    markers = set()
+    markers = {}
     for artifact in artifacts:
         if artifact.get("name") != name or artifact.get("expired"):
             continue
@@ -102,8 +104,57 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
             and run.get("status") == "completed"
             and run.get("conclusion") == "success"
         ):
-            markers.add(f"{run_id}-{run['run_attempt']}")
+            markers[f"{run_id}-{run['run_attempt']}"] = artifact.get("id")
     return markers
+
+
+def ocr_receipt(repository, artifact_id):
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    try:
+        with ZipFile(io.BytesIO(result.stdout)) as archive:
+            info = archive.getinfo("ocr-completion.json")
+            if info.file_size > 65536:
+                raise RuntimeError("OCR completion receipt is too large")
+            receipt = json.loads(archive.read(info))
+    except (BadZipFile, KeyError) as exc:
+        raise RuntimeError("Invalid OCR completion artifact") from exc
+    if not isinstance(receipt, dict):
+        raise RuntimeError("OCR completion receipt must be an object")
+    return receipt
+
+
+def completed_zero_findings(repository, number, head, comments, artifacts):
+    # OCR's zero-findings path omits the run marker. Bind the exact bot comment
+    # through the trusted workflow's receipt instead; text alone is insufficient.
+    summary_urls = {
+        f"https://github.com/{repository}/pull/{number}#issuecomment-{item['id']}"
+        for item in comments
+        if actor(item) == "github-actions[bot]"
+        and re.fullmatch(
+            r"<!-- ocr-summary -->\n✅ \*\*OpenCodeReview\*\*: Review complete: "
+            r"0 finding\(s\) across \d+ selected item\(s\)\.",
+            str(item.get("body") or "").strip(),
+        )
+    }
+    if not summary_urls:
+        return False
+    for artifact_id in artifacts.values():
+        if not artifact_id:
+            continue
+        receipt = ocr_receipt(repository, artifact_id)
+        if (
+            receipt.get("pr") == number
+            and receipt.get("head") == head
+            and isinstance(receipt.get("summary_url"), str)
+            and receipt["summary_url"] in summary_urls
+        ):
+            return True
+    return False
 
 
 def snapshot(repository: str, number: int, request=gh_json):
@@ -194,6 +245,10 @@ def snapshot(repository: str, number: int, request=gh_json):
             for item in comments
         ),
     }
+    if not completed["ocr"]:
+        completed["ocr"] = completed_zero_findings(
+            repository, number, head, comments, completed_runs["ocr"]
+        )
     # Re-read after pagination: never bind a mixed-head snapshot to a receipt.
     current = api_object(f"repos/{repository}/pulls/{number}", request)
     if current.get("state") != "open" or current.get("draft") or current["head"]["sha"] != head:

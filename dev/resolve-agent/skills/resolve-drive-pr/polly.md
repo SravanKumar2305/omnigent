@@ -54,7 +54,11 @@ Completion requires these independent proofs, not just green checks:
   from a successful, completed `open-code-review.yml` run, executing trusted
   workflow code. OCR writes this only after complete output and successful
   publication of all findings. The matching `ocr-summary-run` comment from
-  `github-actions[bot]` must still be available to triage. A summary, an inline
+  `github-actions[bot]` must still be available to triage. For OCR's zero-findings
+  summary, which omits the run marker, the helper reads `ocr-completion.json`
+  from that trusted artifact and requires its PR, head, and summary URL to match
+  the exact bot comment. Record that summary as `not_needed` with a zero-findings
+  justification; other feedback still needs its own disposition. A summary, an inline
   comment, or a successful skipped run alone is insufficient. Read the completion
   proof **before** collecting feedback so the last comments of a finishing review are included.
 
