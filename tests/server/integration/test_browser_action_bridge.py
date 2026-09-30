@@ -39,9 +39,6 @@ from tests.server.helpers import create_test_agent
 pytestmark = pytest.mark.asyncio
 
 
-# ── Auth-enabled fixtures (mirroring test_sessions_elicitation_resolve_url) ──
-
-
 # ── Helpers ──────────────────────────────────────────────────────
 
 

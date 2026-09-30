@@ -632,20 +632,13 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
-@pytest_asyncio.fixture()
-async def client(
+@contextlib.asynccontextmanager
+async def _app_client(
     app: FastAPI,
     mock_llm: ControllableMockClient,
     tmp_path: Path,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """
-    Async HTTP client wired to the FastAPI app (no real server).
-
-    On teardown, releases blocked mock calls and destroys DBOS
-    before the event loop shuts down. This must happen in an async
-    fixture because the pytest-asyncio runner closes the event loop
-    immediately after async fixture teardown completes.
-    """
+    """Serve a real app and drain its harness/relay work before the loop closes."""
     # Initialize the HarnessProcessManager for tests that hit the
     # fallback executor path (when _runner_client is not set).
     from omnigent.runtime import set_harness_process_manager
@@ -655,26 +648,37 @@ async def client(
     await pm.start()
     set_harness_process_manager(pm)
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    # Release blocked mock calls so background threads can finish.
-    mock_llm.release_all()
-    # Cancel any background relay tasks started by PATCH-bound
-    # tests; the stub runner never responds so they'd otherwise
-    # hang teardown. Snapshot first because cancellation fires
-    # the done-callback that mutates the dict.
-    relay_tasks = [h.task for h in sessions_routes._runner_relay_tasks.values()]
-    for task in relay_tasks:
-        if not task.done():
-            task.cancel()
-    for task in relay_tasks:
-        # Let SystemExit / KeyboardInterrupt through so Ctrl-C still aborts.
-        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-    sessions_routes._runner_relay_tasks.clear()
-    set_harness_process_manager(None)
-    await pm.shutdown()
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+    finally:
+        # Release blocked mock calls so background threads can finish.
+        mock_llm.release_all()
+        # Cancel any background relay tasks started by PATCH-bound
+        # tests; the stub runner never responds so they'd otherwise
+        # hang teardown. Snapshot first because cancellation fires
+        # the done-callback that mutates the dict.
+        relay_tasks = [h.task for h in sessions_routes._runner_relay_tasks.values()]
+        for task in relay_tasks:
+            if not task.done():
+                task.cancel()
+        for task in relay_tasks:
+            # Let SystemExit / KeyboardInterrupt through so Ctrl-C still aborts.
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        sessions_routes._runner_relay_tasks.clear()
+        set_harness_process_manager(None)
+        await pm.shutdown()
+
+
+@pytest_asyncio.fixture()
+async def client(
+    app: FastAPI, mock_llm: ControllableMockClient, tmp_path: Path
+) -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP client with real stores and mock LLM responses."""
+    async with _app_client(app, mock_llm, tmp_path) as client:
+        yield client
 
 
 @pytest.fixture()
@@ -705,16 +709,5 @@ async def auth_client(
     tmp_path: Path,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client wired to the auth-enabled app."""
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
+    async with _app_client(auth_app, mock_llm, tmp_path) as client:
+        yield client
