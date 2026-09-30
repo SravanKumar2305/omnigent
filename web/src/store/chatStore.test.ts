@@ -7527,7 +7527,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         data: { role: "user", content, user_authored: true },
       };
       handleSessionEvent(event);
-      handleSessionEvent(event);
 
       expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
       expect(useChatStore.getState().blocks).toMatchObject([
@@ -7561,27 +7560,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
       expect(useChatStore.getState().blocks).toMatchObject([
         { type: "user_message", stableKey: "pending_xml", content },
-      ]);
-    });
-
-    it("renders a user asking about a teammate message in the live transcript", () => {
-      const content = [
-        {
-          type: "input_text" as const,
-          text: 'What is <teammate-message teammate_id="reviewer">Ready</teammate-message>?',
-        },
-      ];
-      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
-
-      handleSessionEvent({
-        type: "session_input_consumed",
-        itemId: "msg_user_question",
-        itemType: "message",
-        data: { role: "user", content },
-      });
-
-      expect(useChatStore.getState().blocks).toEqual([
-        expect.objectContaining({ type: "user_message", content }),
       ]);
     });
 

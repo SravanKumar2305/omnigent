@@ -1,10 +1,13 @@
 """Subagent lifecycle links persist once and never enter agent context."""
 
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
 from omnigent.entities import (
+    Conversation,
+    ConversationItem,
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
@@ -21,45 +24,78 @@ from omnigent.server.subagent_activity import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
+LifecycleStore = tuple[SqlAlchemyConversationStore, Conversation]
+
+
+@pytest.fixture
+def lifecycle_store(db_uri: str) -> LifecycleStore:
+    store = SqlAlchemyConversationStore(db_uri)
+    return store, store.create_conversation()
+
+
+def _child(
+    store: SqlAlchemyConversationStore,
+    parent: Conversation,
+    *,
+    title: str = "Explore:agent-1",
+    labels: dict[str, str] | None = None,
+    sub_agent_name: str | None = None,
+) -> Conversation:
+    child = store.create_conversation(
+        parent_conversation_id=parent.id, title=title, sub_agent_name=sub_agent_name
+    )
+    if labels:
+        store.set_labels(child.id, labels)
+    return child
+
+
+def _activity(store: SqlAlchemyConversationStore, parent_id: str) -> list[ConversationItem]:
+    return [
+        item
+        for item in store.list_items(parent_id, type="resource_event").data
+        if item.data.event_type.startswith("session.subagent.")
+        and item.data.event_type != "session.subagent.completion-observed"
+    ]
+
+
+def _meta(text: str, return_id: str | None = None) -> MessageData:
+    return MessageData(
+        role="user",
+        is_meta=True,
+        content=[{"type": "input_text", "text": text}],
+        subagent_return_id=return_id,
+    )
+
 
 @pytest.mark.parametrize(
-    ("status", "harness", "turn_outcome", "turn_completed", "expected"),
+    ("status", "options", "expected"),
     [
-        ("idle", "claude-native", None, None, None),
-        ("idle", "claude-native", None, True, "completed"),
-        ("failed", "claude-native", None, None, "failed"),
-        ("idle", "cursor-native", "cancelled", None, "cancelled"),
-        ("idle", "cursor-native", "failed", None, "failed"),
-        ("idle", "cursor-native", "completed", None, "completed"),
-        ("idle", "codex-native", None, None, "completed"),
-        ("idle", "claude-native", {}, None, None),
-        ("running", "claude-native", None, None, None),
-        ("idle", None, None, None, None),
-        ("idle", None, None, True, "completed"),
+        ("idle", {"harness": "claude-native"}, None),
+        ("idle", {"harness": "claude-native", "turn_completed": True}, "completed"),
+        ("failed", {"harness": "claude-native"}, "failed"),
+        ("idle", {"harness": "cursor-native", "turn_outcome": "cancelled"}, "cancelled"),
+        ("idle", {"harness": "cursor-native", "turn_outcome": "failed"}, "failed"),
+        ("idle", {"harness": "cursor-native", "turn_outcome": "completed"}, "completed"),
+        ("idle", {"harness": "codex-native"}, "completed"),
+        ("idle", {"harness": "claude-native", "turn_outcome": {}}, None),
+        ("running", {"harness": "claude-native"}, None),
+        ("idle", {"harness": None}, None),
+        ("idle", {"harness": None, "turn_completed": True}, "completed"),
     ],
 )
 def test_native_terminal_status_respects_confirmed_outcomes(
-    status: str,
-    harness: str | None,
-    turn_outcome: object,
-    turn_completed: bool | None,
-    expected: str | None,
+    status: str, options: dict[str, Any], expected: str | None
 ) -> None:
-    assert (
-        native_subagent_terminal_status(
-            status, harness=harness, turn_outcome=turn_outcome, turn_completed=turn_completed
-        )
-        == expected
-    )
+    assert native_subagent_terminal_status(status, **options) == expected
 
 
 @pytest.mark.asyncio
 async def test_lifecycle_preserves_ids_and_deduplicates_each_returned_turn(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    lifecycle_store: LifecycleStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(parent_conversation_id=parent.id, title="Research")
+    store, parent = lifecycle_store
+    child = _child(store, parent, title="Research")
     publish = Mock()
     monkeypatch.setattr("omnigent.server.subagent_activity.session_stream.publish", publish)
 
@@ -86,10 +122,11 @@ async def test_lifecycle_preserves_ids_and_deduplicates_each_returned_turn(
 
 
 @pytest.mark.asyncio
-async def test_native_return_without_turn_id_requires_child_output(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(parent_conversation_id=parent.id, title="Research")
+async def test_native_return_without_turn_id_requires_child_output(
+    lifecycle_store: LifecycleStore,
+) -> None:
+    store, parent = lifecycle_store
+    child = _child(store, parent, title="Research")
     await record_subagent_activity(child.id, "returned", store)
     assert store.list_items(parent.id).data == []
     for turn_id in ("first", "second"):
@@ -122,81 +159,89 @@ async def test_native_return_without_turn_id_requires_child_output(db_uri: str) 
 )
 @pytest.mark.asyncio
 async def test_native_lifecycle_title_hides_technical_prefixes(
-    db_uri: str, title: str, sub_agent_name: str | None, expected: str
+    lifecycle_store: LifecycleStore,
+    title: str,
+    sub_agent_name: str | None,
+    expected: str,
 ) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(
-        parent_conversation_id=parent.id, title=title, sub_agent_name=sub_agent_name
+    store, parent = lifecycle_store
+    child = _child(
+        store,
+        parent,
+        title=title,
+        sub_agent_name=sub_agent_name,
+        labels={"omnigent.wrapper": "native-ui-subagent"},
     )
-    store.set_labels(child.id, {"omnigent.wrapper": "native-ui-subagent"})
     await record_subagent_activity(child.id, "delegated", store)
     assert store.list_items(parent.id).data[0].data.resource == {"title": expected}
 
 
-@pytest.mark.parametrize("completion", ["tool", "notification", "handback", "failed"])
+@pytest.mark.parametrize(
+    ("data", "status"),
+    [
+        (
+            FunctionCallOutputData(
+                call_id="tool-1", output="Inspection finished.", subagent_return_id="agent-1"
+            ),
+            "completed",
+        ),
+        (
+            _meta(
+                "<task-notification><task-id>agent-1</task-id><status>completed</status>"
+                "</task-notification>"
+            ),
+            "completed",
+        ),
+        (_meta('<agent-message from="researcher">Done.</agent-message>', "agent-1"), "completed"),
+        (
+            _meta(
+                "<task-notification><task-id>agent-1</task-id><status>failed</status>"
+                "</task-notification>"
+            ),
+            "failed",
+        ),
+    ],
+    ids=["tool", "notification", "handback", "failed"],
+)
 @pytest.mark.asyncio
-async def test_claude_completion_matches_real_child(db_uri: str, completion: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
-    store.set_labels(
-        child.id,
-        {
+async def test_claude_completion_matches_real_child(
+    lifecycle_store: LifecycleStore,
+    data: FunctionCallOutputData | MessageData,
+    status: str,
+) -> None:
+    store, parent = lifecycle_store
+    child = _child(
+        store,
+        parent,
+        labels={
             "omnigent.claude_native.subagent_id": "agent-1",
             "omnigent.claude_native.tool_use_id": "tool-1",
             "omnigent.claude_native.description": "Inspect authentication",
         },
     )
-    if completion == "tool":
-        item = NewConversationItem(
-            type="function_call_output",
-            response_id="parent-turn",
-            data=FunctionCallOutputData(
-                call_id="tool-1", output="Inspection finished.", subagent_return_id="agent-1"
-            ),
-        )
-    else:
-        text = (
-            "<task-notification><task-id>agent-1</task-id><status>completed</status>"
-            "</task-notification>"
-            if completion in {"notification", "failed"}
-            else '<agent-message from="researcher">Inspection finished.</agent-message>'
-        )
-        if completion == "failed":
-            text = text.replace("completed", "failed")
-        item = NewConversationItem(
-            type="message",
-            response_id="notification-record",
-            data=MessageData(
-                role="user",
-                is_meta=True,
-                content=[{"type": "input_text", "text": text}],
-                subagent_return_id="agent-1" if completion == "handback" else None,
-            ),
-        )
+    item = NewConversationItem(
+        type="function_call_output" if isinstance(data, FunctionCallOutputData) else "message",
+        response_id="completion-record",
+        data=data,
+    )
     await record_claude_subagent_return(parent.id, item, store)
     await record_claude_subagent_return(parent.id, item, store)
-    items = [
-        row
-        for row in store.list_items(parent.id, type="resource_event").data
-        if row.data.event_type == "session.subagent.returned"
-    ]
+    items = _activity(store, parent.id)
     assert len(items) == 1
     assert items[0].data.resource_id == child.id
     assert items[0].data.resource == {
         "title": "Inspect authentication",
-        "status": "failed" if completion == "failed" else "completed",
+        "status": status,
     }
 
 
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.asyncio
-async def test_external_item_paths_record_returned_child_once(db_uri: str, batched: bool) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
-    store.set_labels(child.id, {"omnigent.claude_native.subagent_id": "agent-1"})
+async def test_external_item_paths_record_returned_child_once(
+    lifecycle_store: LifecycleStore, batched: bool
+) -> None:
+    store, parent = lifecycle_store
+    child = _child(store, parent, labels={"omnigent.claude_native.subagent_id": "agent-1"})
     body = SessionEventInput(
         type="external_conversation_item",
         data={
@@ -214,11 +259,7 @@ async def test_external_item_paths_record_returned_child_once(db_uri: str, batch
             await _persist_external_conversation_item(parent.id, parent, body, store)
     items = store.list_items(parent.id).data
     outputs = [item for item in items if item.type == "function_call_output"]
-    activity = [
-        item
-        for item in items
-        if item.type == "resource_event" and item.data.event_type == "session.subagent.returned"
-    ]
+    activity = _activity(store, parent.id)
     assert len(outputs) == 1
     assert outputs[0].data.subagent_return_id == "agent-1"
     assert len(activity) == 1
@@ -226,21 +267,29 @@ async def test_external_item_paths_record_returned_child_once(db_uri: str, batch
 
 
 @pytest.mark.parametrize(
-    "output",
-    ["Async agent launched successfully. agentId: agent-1", '{"status":"async_launched"}'],
+    "data",
+    [
+        FunctionCallOutputData(
+            call_id="tool-1", output="Async agent launched successfully. agentId: agent-1"
+        ),
+        FunctionCallOutputData(call_id="tool-1", output='{"status":"async_launched"}'),
+        _meta('<teammate-message teammate_id="reviewer">Hi</teammate-message>'),
+    ],
+    ids=["launch-text", "launch-json", "teammate-chatter"],
 )
 @pytest.mark.asyncio
-async def test_async_claude_launch_is_not_a_return(db_uri: str, output: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
-    store.set_labels(child.id, {"omnigent.claude_native.tool_use_id": "tool-1"})
+async def test_non_completion_has_no_return_link(
+    lifecycle_store: LifecycleStore,
+    data: FunctionCallOutputData | MessageData,
+) -> None:
+    store, parent = lifecycle_store
+    _child(store, parent, labels={"omnigent.claude_native.tool_use_id": "tool-1"})
     await record_claude_subagent_return(
         parent.id,
         NewConversationItem(
-            type="function_call_output",
+            type="function_call_output" if isinstance(data, FunctionCallOutputData) else "message",
             response_id="parent-turn",
-            data=FunctionCallOutputData(call_id="tool-1", output=output),
+            data=data,
         ),
         store,
     )
@@ -248,35 +297,12 @@ async def test_async_claude_launch_is_not_a_return(db_uri: str, output: str) -> 
 
 
 @pytest.mark.asyncio
-async def test_teammate_chatter_has_no_invented_return_link(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    item = NewConversationItem(
-        type="message",
-        response_id="notification",
-        data=MessageData(
-            role="user",
-            is_meta=True,
-            content=[
-                {
-                    "type": "input_text",
-                    "text": '<teammate-message teammate_id="reviewer">Hi</teammate-message>',
-                }
-            ],
-        ),
-    )
-    await record_claude_subagent_return(parent.id, item, store)
-    assert store.list_items(parent.id).data == []
-
-
-@pytest.mark.asyncio
-async def test_parallel_generic_children_keep_their_task_names(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
+async def test_parallel_generic_children_keep_their_task_names(
+    lifecycle_store: LifecycleStore,
+) -> None:
+    store, parent = lifecycle_store
     for title in ("researcher:Auth audit", "researcher:Storage audit"):
-        child = store.create_conversation(
-            parent_conversation_id=parent.id, title=title, sub_agent_name="researcher"
-        )
+        child = _child(store, parent, title=title, sub_agent_name="researcher")
         await record_subagent_activity(child.id, "delegated", store)
     assert [item.data.resource for item in store.list_items(parent.id).data] == [
         {"title": "Auth audit"},
@@ -284,37 +310,23 @@ async def test_parallel_generic_children_keep_their_task_names(db_uri: str) -> N
     ]
 
 
-@pytest.mark.parametrize("completion", ["tool", "handback", "failed"])
+@pytest.mark.parametrize("failed", [False, True], ids=["completed", "failed"])
 @pytest.mark.asyncio
 async def test_claude_result_arriving_before_child_discovery_is_reconciled(
-    db_uri: str, completion: str
+    lifecycle_store: LifecycleStore, failed: bool
 ) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
+    store, parent = lifecycle_store
     body = SessionEventInput(
         type="external_conversation_item",
         data={
             "source_id": "early-result",
             "response_id": "parent-turn",
-            "item_type": "message" if completion == "handback" else "function_call_output",
+            "item_type": "function_call_output",
             "item_data": {
-                "role": "user",
-                "is_meta": True,
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": '<agent-message from="agent-1">Done.</agent-message>',
-                    }
-                ],
-            }
-            if completion == "handback"
-            else {
                 "call_id": "tool-1",
-                "output": '{"status":"failed","agentId":"agent-1"}'
-                if completion == "failed"
-                else "Done.",
+                "output": '{"status":"failed","agentId":"agent-1"}' if failed else "Done.",
             },
-            **({"subagent_return_id": "agent-1"} if completion != "failed" else {}),
+            **({} if failed else {"subagent_return_id": "agent-1"}),
         },
     )
     await _persist_external_conversation_items(parent.id, [body], store)
@@ -333,53 +345,35 @@ async def test_claude_result_arriving_before_child_discovery_is_reconciled(
             for index in range(101)
         ],
     )
-    child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
-    store.set_labels(
-        child.id,
-        {
+    child = _child(
+        store,
+        parent,
+        labels={
             "omnigent.claude_native.subagent_id": "agent-1",
             "omnigent.claude_native.tool_use_id": "tool-1",
         },
     )
     await record_subagent_activity(child.id, "delegated", store)
     await record_subagent_activity(child.id, "delegated", store)
-    if completion == "failed":
-        assert [
-            row.data.event_type
-            for row in store.list_items(parent.id, type="resource_event").data
-            if row.data.event_type.startswith("session.subagent.")
-            and row.data.event_type != "session.subagent.completion-observed"
-        ] == ["session.subagent.delegated"]
+    if failed:
+        assert [row.data.event_type for row in _activity(store, parent.id)] == [
+            "session.subagent.delegated"
+        ]
         await record_claude_subagent_return(
             parent.id,
             NewConversationItem(
                 type="message",
                 response_id="failure-record",
-                data=MessageData(
-                    role="user",
-                    is_meta=True,
-                    content=[
-                        {
-                            "type": "input_text",
-                            "text": "<task-notification><tool-use-id>tool-1</tool-use-id>"
-                            "<status>failed</status></task-notification>",
-                        }
-                    ],
+                data=_meta(
+                    "<task-notification><tool-use-id>tool-1</tool-use-id>"
+                    "<status>failed</status></task-notification>"
                 ),
             ),
             store,
         )
-    assert [
-        row.data.event_type
-        for row in store.list_items(parent.id, type="resource_event").data
-        if row.data.event_type.startswith("session.subagent.")
-        and row.data.event_type != "session.subagent.completion-observed"
-    ] == ["session.subagent.delegated", "session.subagent.returned"]
-    activity = [
-        row
-        for row in store.list_items(parent.id, type="resource_event").data
-        if row.data.event_type == "session.subagent.returned"
+    activity = _activity(store, parent.id)
+    assert [row.data.event_type for row in activity] == [
+        "session.subagent.delegated",
+        "session.subagent.returned",
     ]
-    assert activity[0].data.resource["status"] == (
-        "failed" if completion == "failed" else "completed"
-    )
+    assert activity[-1].data.resource["status"] == ("failed" if failed else "completed")

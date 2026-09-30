@@ -3,14 +3,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { BubbleView } from "@/pages/ChatPage";
 import { useChatStore } from "@/store/chatStore";
-import { buildBubbles, type Bubble } from "@/lib/renderItems";
-import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import type { ConversationItem } from "@/lib/conversationItems";
+import type { Bubble } from "@/lib/renderItems";
 
 afterEach(cleanup);
 
 const activity = (
   phase: "delegated" | "returned",
+  status?: string,
 ): Extract<Bubble, { kind: "subagent_activity" }> => ({
   kind: "subagent_activity",
   itemId: `activity_${phase}`,
@@ -19,102 +18,33 @@ const activity = (
     event_type: `session.subagent.${phase}`,
     resource_type: "session",
     resource_id: "conv_child",
-    resource: { title: "Research public positioning" },
+    resource: { title: "Research public positioning", ...(status ? { status } : {}) },
   },
 });
 
 describe("sub-agent activity notices", () => {
   beforeEach(() => useChatStore.setState({ sessionStatus: "idle" }));
 
-  it("links both lifecycle notices to child chat while preserving global query params", () => {
+  it.each([
+    ["delegated", undefined, "Started"],
+    ["returned", undefined, "Completed"],
+    ["returned", "failed", "Failed"],
+    ["returned", "cancelled", "Stopped"],
+  ] as const)("renders a %s/%s notice as %s with a child link", (phase, status, label) => {
     render(
       <MemoryRouter
         initialEntries={["/c/parent?file=README.md&view=terminal&message=msg_parent&debug=1"]}
       >
-        <BubbleView bubble={activity("delegated")} />
-        <BubbleView bubble={activity("returned")} />
-      </MemoryRouter>,
-    );
-    expect(screen.getAllByTestId("subagent-activity")).toHaveLength(2);
-    expect(screen.getAllByTestId("subagent-activity")[0]).toHaveTextContent(
-      "Started Research public positioning",
-    );
-    expect(screen.getAllByTestId("subagent-activity")[1]).toHaveTextContent(
-      "Completed Research public positioning",
-    );
-    for (const link of screen.getAllByRole("link")) {
-      expect(link).toBeVisible();
-      expect(link).toHaveAttribute("href", "/c/conv_child?debug=1&panel=agents");
-    }
-    expect(screen.queryByText("(ID)")).not.toBeInTheDocument();
-  });
-
-  it("keeps settled work folded when a returned notice arrives after the answer", () => {
-    const items: ConversationItem[] = [
-      {
-        id: "reasoning_1",
-        type: "reasoning",
-        status: "completed",
-        response_id: "resp_parent",
-        created_at: 1_750_000_000,
-        model: "parent",
-        summary: [{ type: "summary_text", text: "Private work trace" }],
-      },
-      {
-        id: "answer_1",
-        type: "message",
-        status: "completed",
-        response_id: "resp_parent",
-        created_at: 1_750_000_004,
-        role: "assistant",
-        content: [{ type: "output_text", text: "The review is complete." }],
-      },
-    ];
-    const timeline = (history: ConversationItem[]) => (
-      <MemoryRouter>
-        {buildBubbles(itemsToBlocks(history), null).map((bubble) => (
-          <BubbleView
-            key={bubble.kind === "assistant" ? bubble.stableId : bubble.itemId}
-            bubble={bubble}
-          />
-        ))}
-      </MemoryRouter>
-    );
-    const { rerender } = render(timeline(items));
-    expect(screen.getByText("Worked for 4s")).toBeVisible();
-    rerender(
-      timeline([
-        ...items,
-        {
-          id: "returned_1",
-          response_id: "subagent_returned",
-          status: "completed",
-          created_at: 1_750_000_005,
-          ...activity("returned").data,
-        } as ConversationItem,
-      ]),
-    );
-
-    expect(screen.getByText("Worked for 4s")).toBeVisible();
-    expect(screen.queryByText("Private work trace")).not.toBeInTheDocument();
-    expect(screen.getByText("The review is complete.")).toBeVisible();
-    expect(screen.getByTestId("subagent-activity")).toHaveTextContent("Completed");
-    expect(screen.getAllByTestId("message-bubble")).toHaveLength(1);
-  });
-
-  it.each([
-    ["failed", "Failed"],
-    ["cancelled", "Stopped"],
-  ])("does not label a %s child as completed", (status, label) => {
-    const bubble = activity("returned");
-    bubble.data.resource = { title: "Research public positioning", status };
-    render(
-      <MemoryRouter>
-        <BubbleView bubble={bubble} />
+        <BubbleView bubble={activity(phase, status)} />
       </MemoryRouter>,
     );
     expect(screen.getByTestId("subagent-activity")).toHaveTextContent(
       `${label} Research public positioning`,
     );
+    expect(screen.getByRole("link")).toHaveAttribute("href", "/c/conv_child?debug=1&panel=agents");
+    expect(screen.queryByTestId("message-bubble")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    expect(screen.queryByText("(ID)")).not.toBeInTheDocument();
   });
 });

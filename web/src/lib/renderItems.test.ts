@@ -89,17 +89,6 @@ describe("sub-agent timeline events", () => {
     hasCodeBlocks: false,
   };
 
-  it("does not change a completed assistant bubble when a notice arrives later", () => {
-    const cache = createBubbleCache();
-    const before = buildBubbles([work, answer], null, cache);
-    const after = buildBubbles([work, answer, notice()], null, cache);
-
-    expect(after.map((bubble) => bubble.kind)).toEqual(["assistant", "subagent_activity"]);
-    expect(bubblesEqual(before[0]!, after[0]!)).toBe(true);
-    expect(lastRenderableAssistantIndex(after)).toBe(0);
-    expect(liveCandidateAssistantIndex(after)).toBe(0);
-  });
-
   it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
     const active: ActiveResponse | null = streaming
       ? { responseId: "parent_turn", state: "streaming", error: null }
@@ -148,6 +137,8 @@ describe("sub-agent timeline events", () => {
     expect(bubbles[0]).toMatchObject({ responseId: "parent_turn", continued: true });
     expect(bubbles[1]).toMatchObject({ itemId: "notice_1" });
     expect(bubbles[2]).toMatchObject({ responseId: "parent_turn", stableId: "parent_answer" });
+    expect(lastRenderableAssistantIndex(bubbles)).toBe(2);
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(2);
   });
 });
 

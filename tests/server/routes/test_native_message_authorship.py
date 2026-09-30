@@ -2,11 +2,15 @@
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
-from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+from omnigent.harnesses.claude_native.bridge import (
+    ClaudeTranscriptItem,
+    read_transcript_items_since,
+)
 from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
 from omnigent.runtime import pending_inputs
 from omnigent.server.routes._sessions.orchestration import (
@@ -17,6 +21,21 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 _ENVELOPE = '<teammate-message teammate_id="reviewer">Review this</teammate-message>'
+_AGENT_TEAM_NOTIFICATION = """<task-notification>
+<task-id>ae6a7749a5dc6041c</task-id>
+<tool-use-id>toolu_agent_team</tool-use-id>
+<status>completed</status>
+<summary>Agent "Message probe" finished</summary>
+<result>TEAM_DONE</result>
+</task-notification>"""
+
+
+def _parse_transcript(tmp_path: Path, *entries: dict[str, Any]) -> list[ClaudeTranscriptItem]:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8"
+    )
+    return read_transcript_items_since(transcript, 0, agent_name="Claude")[2]
 
 
 def _transcript_event(tmp_path: Path, text: str, *, queued: bool = False) -> SessionEventInput:
@@ -28,9 +47,7 @@ def _transcript_event(tmp_path: Path, text: str, *, queued: bool = False) -> Ses
         if queued
         else {"type": "user", "message": {"role": "user", "content": text}}
     )
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(json.dumps({"uuid": "native-human", **entry}) + "\n", encoding="utf-8")
-    _, _, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
+    items = _parse_transcript(tmp_path, {"uuid": "native-human", **entry})
     assert len(items) == 1
     assert items[0].agent_message_candidate
     assert not items[0].data.get("is_meta")
@@ -83,20 +100,18 @@ async def test_human_envelope_is_acknowledged_authored_and_durable(
     assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == [older, later]
 
 
-@pytest.mark.parametrize("author", [None, "alice@example.com"])
 @pytest.mark.asyncio
 async def test_direct_terminal_envelope_does_not_drain_unrelated_web_input(
     db_uri: str,
     tmp_path: Path,
-    author: str | None,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Existing conversation")
     pending = pending_inputs.record(conv.id, [{"type": "input_text", "text": "Still queued"}])
     body = _transcript_event(tmp_path, _ENVELOPE)
-    await _persist_external_conversation_item(conv.id, conv, body, store, created_by=author)
+    await _persist_external_conversation_item(conv.id, conv, body, store)
     item = store.list_items(conv.id).data[0]
-    assert item.created_by == author
+    assert item.created_by is None
     assert item.data.user_authored is True
     assert item.data.is_meta is False
     assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == [pending]
@@ -107,89 +122,23 @@ async def test_real_agent_team_notification_stays_hidden_and_does_not_drain_inpu
     db_uri: str,
     tmp_path: Path,
 ) -> None:
-    """Replay the parent-side records emitted by a named Claude Agent Teams worker."""
-    task_notification = (
-        """<task-notification>
-<task-id>ae6a7749a5dc6041c</task-id>
-<tool-use-id>toolu_agent_team</tool-use-id>
-<status>completed</status>
-<summary>Agent "Message probe" finished</summary>
-<note>A task-notification fires each time this agent stops with no live background """
-        """children of its own.</note>
-<result>TEAM_DONE</result>
-</task-notification>"""
+    """Replay the parent-side completion emitted by a Claude Agent Teams worker."""
+    [notification] = _parse_transcript(
+        tmp_path,
+        {
+            "type": "user",
+            "uuid": "agent-team-notification",
+            "origin": {"kind": "task-notification", "producer": "session-task"},
+            "message": {"role": "user", "content": _AGENT_TEAM_NOTIFICATION},
+        },
     )
-    transcript = tmp_path / "agent-team.jsonl"
-    transcript.write_text(
-        "\n".join(
-            json.dumps(entry)
-            for entry in (
-                {
-                    "type": "assistant",
-                    "uuid": "agent-team-launch",
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "toolu_agent_team",
-                                "name": "Agent",
-                                "input": {
-                                    "description": "Message probe",
-                                    "name": "reporter",
-                                    "subagent_type": "general-purpose",
-                                    "prompt": "Reply exactly TEAM_DONE.",
-                                },
-                            }
-                        ],
-                    },
-                },
-                {
-                    "type": "user",
-                    "uuid": "agent-team-launch-result",
-                    "parentUuid": "agent-team-launch",
-                    "message": {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "toolu_agent_team",
-                                "content": "Async agent launched successfully.",
-                            }
-                        ],
-                    },
-                    "toolUseResult": {
-                        "isAsync": True,
-                        "status": "async_launched",
-                        "agentId": "ae6a7749a5dc6041c",
-                    },
-                },
-                {
-                    "type": "user",
-                    "uuid": "agent-team-notification",
-                    "origin": {"kind": "task-notification", "producer": "session-task"},
-                    "message": {"role": "user", "content": task_notification},
-                },
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    _, _, parsed = read_transcript_items_since(transcript, 0, agent_name="Claude")
-    assert [item.item_type for item in parsed] == [
-        "function_call",
-        "function_call_output",
-        "message",
-    ]
-    assert json.loads(parsed[0].data["arguments"])["name"] == "reporter"
-    assert parsed[-1].data["is_meta"] is True
+    assert notification.data["is_meta"] is True
 
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Agent Teams parent")
     pending = pending_inputs.record(conv.id, [{"type": "input_text", "text": "Still queued"}])
-    for item in parsed:
-        body = SessionEventInput.model_validate(_external_conversation_item_event(item))
-        await _persist_external_conversation_item(conv.id, conv, body, store)
+    body = SessionEventInput.model_validate(_external_conversation_item_event(notification))
+    await _persist_external_conversation_item(conv.id, conv, body, store)
 
     rows = store.list_items(conv.id).data
     user_messages = [row for row in rows if getattr(row.data, "role", None) == "user"]

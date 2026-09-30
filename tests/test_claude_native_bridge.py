@@ -1268,6 +1268,18 @@ _TEAMMATE_MESSAGE = (
 )
 
 
+def _read_native_entries(
+    tmp_path: Path,
+    *entries: dict[str, Any],
+    response_id: str | None = None,
+) -> tuple[int, str | None, list[Any]]:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("".join(_transcript_line(entry) for entry in entries), encoding="utf-8")
+    return read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id=response_id
+    )
+
+
 @pytest.mark.parametrize("as_blocks", [False, True])
 @pytest.mark.parametrize(
     ("text", "origin"),
@@ -1294,23 +1306,18 @@ _TEAMMATE_MESSAGE = (
 def test_read_transcript_items_distinguishes_teammate_provenance(
     tmp_path: Path, as_blocks: bool, text: str, origin: dict[str, str] | None
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(
-            {
-                "type": "user",
-                "uuid": "teammate-result",
-                "origin": origin,
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}] if as_blocks else text,
-                },
-            }
-        ),
-        encoding="utf-8",
+    _, _, items = _read_native_entries(
+        tmp_path,
+        {
+            "type": "user",
+            "uuid": "teammate-result",
+            **({"origin": origin} if origin else {}),
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}] if as_blocks else text,
+            },
+        },
     )
-
-    _, _, items = read_transcript_items_since(transcript, 0, agent_name="claude-native-ui")
 
     assert len(items) == 1
     assert items[0].data == {
@@ -1333,27 +1340,21 @@ def test_read_transcript_items_distinguishes_teammate_provenance(
 def test_read_transcript_items_keeps_human_text_and_tool_results_with_teammate_blocks(
     tmp_path: Path, human_text: str
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(
-            {
-                "type": "user",
-                "uuid": "mixed-content",
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _TEAMMATE_MESSAGE},
-                        {"type": "text", "text": human_text},
-                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "done"},
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    _, _, items = read_transcript_items_since(
-        transcript, 0, agent_name="claude-native-ui", current_response_id="resp_active"
+    _, _, items = _read_native_entries(
+        tmp_path,
+        {
+            "type": "user",
+            "uuid": "mixed-content",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _TEAMMATE_MESSAGE},
+                    {"type": "text", "text": human_text},
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "done"},
+                ],
+            },
+        },
+        response_id="resp_active",
     )
 
     visible = [item for item in items if not item.data.get("is_meta")]
@@ -1379,26 +1380,20 @@ def test_read_transcript_items_keeps_human_text_and_tool_results_with_teammate_b
 def test_read_transcript_items_skips_queued_agent_notifications(
     tmp_path: Path, prompt: str, metadata: dict[str, Any]
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(
-            {
-                "type": "attachment",
-                "uuid": "queued-notification",
-                "attachment": {
-                    "type": "queued_command",
-                    "commandMode": "prompt",
-                    "prompt": prompt,
-                    **metadata,
-                },
-            }
-        )
-        + _transcript_line(_assistant_text_entry("continued", "Here are the findings.")),
-        encoding="utf-8",
-    )
-
-    cursor, response_id, items = read_transcript_items_since(
-        transcript, 0, agent_name="claude-native-ui", current_response_id="resp_active"
+    cursor, response_id, items = _read_native_entries(
+        tmp_path,
+        {
+            "type": "attachment",
+            "uuid": "queued-notification",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "prompt",
+                "prompt": prompt,
+                **metadata,
+            },
+        },
+        _assistant_text_entry("continued", "Here are the findings."),
+        response_id="resp_active",
     )
 
     assert cursor == 2
@@ -1411,26 +1406,24 @@ def test_read_transcript_items_skips_queued_agent_notifications(
 def test_teammate_message_preserves_active_assistant_response(
     tmp_path: Path, as_blocks: bool
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(_assistant_text_entry("before", "Still researching."))
-        + _transcript_line(
-            {
-                "type": "user",
-                "uuid": "teammate",
-                "origin": {"kind": "peer"},
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": _TEAMMATE_MESSAGE}]
+    _, response_id, items = _read_native_entries(
+        tmp_path,
+        _assistant_text_entry("before", "Still researching."),
+        {
+            "type": "user",
+            "uuid": "teammate",
+            "origin": {"kind": "peer"},
+            "message": {
+                "role": "user",
+                "content": (
+                    [{"type": "text", "text": _TEAMMATE_MESSAGE}]
                     if as_blocks
-                    else _TEAMMATE_MESSAGE,
-                },
-            }
-        )
-        + _transcript_line(_assistant_text_entry("after", "More findings.")),
-        encoding="utf-8",
+                    else _TEAMMATE_MESSAGE
+                ),
+            },
+        },
+        _assistant_text_entry("after", "More findings."),
     )
-    _, response_id, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
     assert items[0].response_id == items[-1].response_id == response_id
     assert items[1].data["is_meta"] is True
 
@@ -1462,11 +1455,7 @@ def test_native_completion_keeps_hidden_provenance(
         if queued
         else {"type": "user", "message": {"role": "user", "content": text}, **metadata}
     )
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(_transcript_line(entry), encoding="utf-8")
-    _, response_id, items = read_transcript_items_since(
-        transcript, 0, agent_name="Claude", current_response_id="active"
-    )
+    _, response_id, items = _read_native_entries(tmp_path, entry, response_id="active")
     assert len(items) == 1
     assert items[0].data["is_meta"] is True
     assert items[0].subagent_return_id == ("agent-1" if handback else None)
@@ -1478,28 +1467,20 @@ def test_native_completion_keeps_hidden_provenance(
 def test_native_agent_tool_result_carries_only_completion_provenance(
     tmp_path: Path, status: str
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(
-            {
-                "type": "user",
-                "uuid": "tool-result",
-                "toolUseResult": {"agentId": "agent-1", "status": status},
-                "message": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "tool-1",
-                            "content": "Result text",
-                        }
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
+    _, _, items = _read_native_entries(
+        tmp_path,
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "toolUseResult": {"agentId": "agent-1", "status": status},
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "Result text"}
+                ],
+            },
+        },
     )
-    _, _, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
     assert len(items) == 1
     assert items[0].subagent_return_id == ("agent-1" if status == "completed" else None)
 
@@ -1515,22 +1496,17 @@ def test_native_agent_tool_result_carries_only_completion_provenance(
 def test_partial_meta_completion_never_becomes_user_message(
     tmp_path: Path, text: str, as_blocks: bool
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(
-            {
-                "type": "user",
-                "isMeta": True,
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}] if as_blocks else text,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    _, response_id, items = read_transcript_items_since(
-        transcript, 0, agent_name="Claude", current_response_id="active"
+    _, response_id, items = _read_native_entries(
+        tmp_path,
+        {
+            "type": "user",
+            "isMeta": True,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}] if as_blocks else text,
+            },
+        },
+        response_id="active",
     )
     assert items == []
     assert response_id == "active"
@@ -1550,21 +1526,14 @@ def test_meta_completion_companion_text_stays_hidden(
     ]
     if companion_first:
         blocks.reverse()
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        _transcript_line(
-            {
-                "type": "user",
-                "isMeta": True,
-                "message": {
-                    "role": "user",
-                    "content": blocks,
-                },
-            }
-        ),
-        encoding="utf-8",
+    _, _, items = _read_native_entries(
+        tmp_path,
+        {
+            "type": "user",
+            "isMeta": True,
+            "message": {"role": "user", "content": blocks},
+        },
     )
-    _, _, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
     assert len(items) == 2
     assert all(item.data.get("is_meta") is True for item in items)
 

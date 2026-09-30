@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import re
-from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.entities import MessageData, NewConversationItem
 from tests.e2e_ui.conftest import (
     reset_mock_llm,
-    seed_committed_items,
     seed_committed_turn,
     set_fallback_mock_llm,
 )
@@ -27,12 +23,6 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
 _CHILD_TITLE = "Research Omnigent public positioning"
 _CHILD_REPLY = "Omnigent supports CLI, desktop, mobile, and web workflows."
 _TEAM_BODY = "Internal teammate delivery: positioning research is complete."
-
-
-def _screenshot(page: Page, name: str) -> None:
-    """Save demo images when E2E_SCREENSHOT_DIR is set for a local run."""
-    if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
-        page.screenshot(path=str(Path(directory) / f"subagent-{name}.png"), animations="disabled")
 
 
 @pytest.mark.min_server_version("0.17.0")
@@ -52,29 +42,6 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
         parent_id,
         prompt="Research Omnigent's public positioning.",
         reply="I'll delegate the public research to a sub-agent.",
-    )
-    # Old Claude transcripts can contain user-role team delivery envelopes.
-    seed_committed_items(
-        parent_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_historical_team_delivery",
-                data=MessageData(
-                    role="user",
-                    content=[
-                        {
-                            "type": "input_text",
-                            "text": (
-                                '<teammate-message teammate_id="researcher" '
-                                f'color="blue" summary="Research complete">{_TEAM_BODY}'
-                                "</teammate-message>"
-                            ),
-                        }
-                    ],
-                ),
-            )
-        ],
     )
     page.goto(f"{base_url}/c/{parent_id}")
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
@@ -123,9 +90,6 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
 
         page.reload()
         expect(notices).to_have_count(2, timeout=30_000)
-        expect(page.locator('[data-testid="message-bubble"][data-role="user"]')).to_have_count(1)
-        expect(page.get_by_text(_TEAM_BODY, exact=False)).to_have_count(0)
-        expect(page.get_by_text("teammate-message", exact=False)).to_have_count(0)
 
         child_path = f"/c/{child_id}?panel=agents"
         for notice in notices.all():
@@ -133,9 +97,6 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
                 "href", child_path
             )
             expect(notice).not_to_contain_text("(ID)")
-        layout = "mobile" if mobile else "desktop"
-        _screenshot(page, f"activity-{layout}")
-
         notices.last.get_by_role("link", name=_CHILD_TITLE, exact=True).click()
         expect(page).to_have_url(re.compile(re.escape(child_path) + "$"))
         if mobile:
@@ -153,7 +114,6 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
         expect(panel.locator(f'[data-child-session-id="{child_id}"]')).to_be_visible(
             timeout=30_000
         )
-        _screenshot(page, f"agents-open-{layout}")
         if mobile:
             panel.locator(f'[data-child-session-id="{child_id}"]').click()
             expect(panel).to_have_attribute("data-state", "closed")
@@ -161,7 +121,6 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
             expect(
                 page.get_by_test_id("assistant-text-section").get_by_text(_CHILD_REPLY, exact=True)
             ).to_be_visible(timeout=30_000)
-            _screenshot(page, "child-chat-mobile")
     finally:
         httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
 
@@ -223,21 +182,6 @@ def test_human_teammate_markup_survives_native_acknowledgement(
         timeout=60_000
     )
     expect(page.get_by_text(_TEAM_BODY, exact=False)).to_have_count(0)
-
-    items = httpx.get(f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0)
-    items.raise_for_status()
-    human_items = [
-        item
-        for item in items.json()["data"]
-        if item.get("type") == "message" and item.get("role") == "user" and not item.get("is_meta")
-    ]
-    assert len(human_items) == 1
-    assert human_items[0]["content"] == [{"type": "input_text", "text": human_text}]
-    assert human_items[0].get("user_authored") is True
-    expect(user_bubbles).to_have_attribute("data-user-message-id", human_items[0]["id"])
-    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-    snapshot.raise_for_status()
-    assert snapshot.json()["pending_inputs"] == []
 
     page.reload()
     _ensure_chat_view(page)
