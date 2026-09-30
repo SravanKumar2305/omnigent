@@ -873,12 +873,51 @@ async def test_handle_launch_fails_for_bad_workspace(
     )
     assert failure.attributes["host_request_id"] == frame.request_id
     assert failure.attributes["error_code"] == WORKSPACE_MISSING_ERROR_CODE
+    assert failure.attributes["error_category"] == "user"
+    assert failure.attributes["error_impact"] == "blocking"
+    assert failure.attributes["error_phase"] == "harness_setup"
     assert "session_missing_workspace" in caplog.text
     assert "/nonexistent/path/that/does/not/exist" in caplog.text
     output = capsys.readouterr().out
     assert "Runner launch failed" in output
     assert "session_missing_workspace" in output
     assert "/nonexistent/path/that/does/not/exist" in output
+
+
+async def test_handle_launch_attributes_spawn_failure_to_host(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
+    host = _make_host_process()
+
+    def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise OSError(errno.ENOSPC, "No space left on device", str(tmp_path / "runner.log"))
+
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _disk_full)
+    frame = HostLaunchRunnerFrame(
+        request_id="req_disk_full",
+        binding_token="token_disk_full",
+        workspace=str(tmp_path),
+        session_id="session_disk_full",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    assert failure.attributes["error_code"] == "runner_spawn_failed"
+    assert failure.attributes["error_category"] == "host"
+    assert failure.attributes["error_impact"] == "blocking"
+    assert failure.attributes["error_phase"] == "runner_launch"
 
 
 @pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])

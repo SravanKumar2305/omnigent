@@ -1334,8 +1334,10 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Report an uncategorized host refusal as a failed start, not launch."""
+    caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -1375,6 +1377,10 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     assert "failed to spawn runner: boom" in error["message"], error["message"]
     assert "The host launched" not in error["message"], error["message"]
     assert "never connected" not in error["message"], error["message"]
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Uncoded: the host's own row carries the category.
+    assert refusal.attributes.get("error_category") is None
+    assert refusal.attributes["error_impact"] == "blocking"
 
     # The refusal text must never enter RunnerExitReports: the session
     # snapshot reads that store UNscoped (last_task_error), so a record
@@ -1391,8 +1397,10 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Do not claim a launch when the host never acknowledged it."""
+    caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
@@ -1454,6 +1462,11 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     assert "never confirmed the launch" in error["message"], error["message"]
     assert "The host was asked to launch runner" in error["message"], error["message"]
     assert "The host launched" not in error["message"], error["message"]
+    [timeout] = [
+        r for r in caplog.records if r.getMessage() == "Host launch acknowledgement timed out"
+    ]
+    assert timeout.attributes["error_category"] == "host"
+    assert timeout.attributes["error_impact"] == "transient"
 
 
 async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(

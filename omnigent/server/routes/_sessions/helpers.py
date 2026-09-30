@@ -61,7 +61,15 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    category_for_code,
+    restart_on_stale_cursor,
+)
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
@@ -5866,20 +5874,36 @@ async def _launch_runner_on_host_locked(
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
             host_conn.pending_launches.pop(request_id, None)
+            # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
                 extra=debug_event(
-                    "runner_launch_failed", stage="runner_launch", error_code="host_launch_timeout"
+                    "runner_launch_failed",
+                    stage="runner_launch",
+                    error_code="host_launch_timeout",
+                    error_category=ErrorCategory.HOST.value,
+                    error_impact=ErrorImpact.TRANSIENT.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         if result.get("status") == "failed":
+            refusal_code = result.get("error_code")
+            # Unmapped codes (spawn failures) are attributed on the host's own row.
+            refusal_category: str | None = None
+            if isinstance(refusal_code, str):
+                mapped = category_for_code(refusal_code)
+                if mapped is not ErrorCategory.UNKNOWN:
+                    refusal_category = mapped.value
             _logger.error(
                 "Host refused runner launch",
                 extra=debug_event(
                     "runner_launch_failed",
                     stage="runner_launch",
-                    error_code=result.get("error_code"),
+                    error_code=refusal_code,
+                    error_category=refusal_category,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
             return _HostLaunchAttempt(

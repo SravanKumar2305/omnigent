@@ -389,3 +389,19 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
     assert events[0]["attributes"]["resume_interrupted_turn"] == "False"
     assert events[0]["attributes"]["suppress_recovery_turn"] == "False"
     assert "recovery_id" not in events[0]["attributes"]
+
+
+@pytest.mark.asyncio
+async def test_init_attributes_dropped_tunnel_to_runner() -> None:
+    from tests.debug_log_helpers import capture_debug_rows
+
+    class _DroppedTunnelClient(_Client):
+        async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
+            raise ConnectionError("tunnel closed before request completed")
+
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")  # type: ignore[arg-type]
+    with capture_debug_rows("server") as rows, pytest.raises(ConnectionError):
+        await initializer.initialize(_conversation(), _DroppedTunnelClient(), timeout=1)  # type: ignore[arg-type]
+    [failed] = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
+    assert failed["attributes"]["error_category"] == "runner"
+    assert failed["attributes"]["error_impact"] == "transient"

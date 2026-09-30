@@ -46,7 +46,13 @@ from omnigent.debug_logging import (
     debug_event,
     runner_log_scope,
 )
-from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorImpact,
+    ErrorPhase,
+    category_for_code,
+    phase_for_code,
+)
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -1646,12 +1652,15 @@ class HostProcess:
         error: str,
         *,
         error_code: str | None = None,
+        error_category: ErrorCategory = ErrorCategory.HOST,
     ) -> HostLaunchRunnerResultFrame:
         """Report and return a failed runner launch.
 
         :param frame: Launch request that failed.
         :param error: Human-readable failure reason.
         :param error_code: Optional machine-readable failure category.
+        :param error_category: Fault attribution for an uncoded failure; a coded
+            preflight refusal uses its code's mapping instead.
         :returns: Failed result frame for the server.
         """
         session_id = frame.session_id or "<unknown>"
@@ -1673,6 +1682,13 @@ class HostProcess:
                 host_request_id=frame.request_id,
                 stage="runner_launch",
                 error_code=error_code or "runner_spawn_failed",
+                error_category=(
+                    category_for_code(error_code) if error_code else error_category
+                ).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=(
+                    phase_for_code(error_code) if error_code else ErrorPhase.RUNNER_LAUNCH
+                ).value,
             ),
         )
         print(
@@ -1916,7 +1932,7 @@ class HostProcess:
             self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
-            return self._launch_failed(frame, error)
+            return self._launch_failed(frame, error, error_category=ErrorCategory.RUNNER)
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is

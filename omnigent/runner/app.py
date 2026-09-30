@@ -60,7 +60,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -3628,12 +3628,24 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        diagnosis = classify_terminal_failure(
+            command=event.command, exit_status=event.exit_status, output=event.last_output
+        )
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
             event.session_id,
             error.get("message"),
-            extra={"session_id": event.session_id},
+            extra=debug_event(
+                "required_terminal_exited",
+                session_id=event.session_id,
+                terminal_name=event.terminal_name,
+                terminal_exit_status=event.exit_status,
+                error_code=error["code"],
+                # An unrecognized exit is the harness CLI dying under the runner.
+                error_category=(diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+            ),
         )
         _publish_event(
             event.session_id,
