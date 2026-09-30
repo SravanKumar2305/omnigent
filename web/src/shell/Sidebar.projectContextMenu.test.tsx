@@ -29,53 +29,39 @@ vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [] }),
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-    variables: undefined,
-  }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [{ id: PROJECT_ID, name: PROJECT_NAME }] }),
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => mocks.deleteProject,
-  useRenameProject: () => mocks.renameProject,
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: {}, isLoading: false, isError: false }),
-  useUpdateProjectConfig: () => ({
-    mutate: vi.fn(),
-    mutateAsync: vi.fn(() => Promise.resolve()),
-    isPending: false,
-    isError: false,
-    error: null,
-  }),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useStopAndDeleteConversation: () => ({
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      isPending: false,
+      isError: false,
+      variables: undefined,
+    }),
+    useProjects: () => ({ data: [{ id: PROJECT_ID, name: PROJECT_NAME }] }),
+    useProjectSessions: () => ({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    }),
+    useDeleteProject: () => mocks.deleteProject,
+    useRenameProject: () => mocks.renameProject,
+    useProjectConfig: () => ({ data: {}, isLoading: false, isError: false }),
+    useUpdateProjectConfig: () => ({
+      mutate: vi.fn(),
+      mutateAsync: vi.fn(() => Promise.resolve()),
+      isPending: false,
+      isError: false,
+      error: null,
+    }),
+  };
+});
 
 vi.mock("./ProjectSettingsDialog", () => ({
   ProjectSettingsDialog: ({ open }: { open: boolean }) =>
