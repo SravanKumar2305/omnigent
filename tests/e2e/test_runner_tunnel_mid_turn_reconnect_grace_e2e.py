@@ -537,10 +537,8 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
         f"Server log tail:\n{server_log[-5000:]}"
     )
 
-    # Read the server's own log file, not its captured stderr: stderr
-    # mirroring is env-dependent, so a count there could be zero and pass
-    # vacuously. One transport-lost row opens the outage; a polling relay
-    # then logs a retry line per attempt.
+    # One transport-lost row proves the outage occurred; a polling relay then
+    # logs a retry per attempt. Count both in the server's own log file.
     outages = server_log.count(f"Relay: runner transport lost for session={session_id} (")
     assert outages >= 1, "the blackout never registered as a transport loss in the server log"
     retry_lines = [
