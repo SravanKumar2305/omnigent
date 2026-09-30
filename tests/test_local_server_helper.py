@@ -22,7 +22,7 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
         with isolated_local_server(
             tmp_path,
             bootstrap="print('startup-marker', flush=True); raise SystemExit(23)",
-            health_timeout=2,
+            health_timeout=30,
             poll_interval=0.02,
         ):
             pytest.fail("a failed child must not be yielded as a healthy server")

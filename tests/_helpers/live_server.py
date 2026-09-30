@@ -164,15 +164,17 @@ def isolated_local_server(
                         f"Server log tail:\n{log_path.read_text(errors='replace')[-4000:]}"
                     )
                     try:
-                        if client.get(f"{base_url}/health", timeout=2.0).status_code == 200:
+                        resp = client.get(f"{base_url}/health", timeout=2.0)
+                        if resp.status_code == 200:
                             break
-                        last = "non-200"
+                        last = f"HTTP {resp.status_code}"
                     except httpx.HTTPError as exc:
                         last = f"{type(exc).__name__}: {exc}"
                     time.sleep(poll_interval)
                 else:
                     raise AssertionError(
-                        f"{base_url}/health never became healthy: {last}\n"
+                        f"{base_url}/health never became healthy: {last} "
+                        f"(process exit code: {proc.poll()})\n"
                         f"Server log tail:\n{log_path.read_text(errors='replace')[-4000:]}"
                     )
             yield base_url
