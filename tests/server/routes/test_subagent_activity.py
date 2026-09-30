@@ -4,6 +4,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from sqlalchemy import event
 
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.routes._sessions.orchestration import (
@@ -68,7 +69,9 @@ def _message(text: str) -> dict[str, Any]:
     return {"role": "user", "is_meta": True, "content": [{"type": "input_text", "text": text}]}
 
 
-@pytest.mark.parametrize("late,batched", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "late,batched", [(False, False), (False, True), (True, False), (True, True)]
+)
 @pytest.mark.parametrize(
     "data,return_id,expected",
     [
@@ -139,11 +142,30 @@ async def test_claude_completion_survives_retries_and_late_child_discovery(
             "subagent_return_id": return_id,
         },
     )
-    for _ in range(2):
+
+    async def deliver() -> None:
         if batched:
             await _persist_external_conversation_items(parent.id, [body], store)
         else:
             await _persist_external_conversation_item(parent.id, parent, body, store)
+
+    if late and expected:
+
+        def fail_marker_write(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith("INSERT") and "session.subagent.completion-observed" in str(
+                parameters
+            ):
+                raise RuntimeError("marker write failed")
+
+        event.listen(store._conv_engine, "after_cursor_execute", fail_marker_write)
+        try:
+            with pytest.raises(RuntimeError, match="marker write failed"):
+                await deliver()
+        finally:
+            event.remove(store._conv_engine, "after_cursor_execute", fail_marker_write)
+        assert store.list_items(parent.id).data == []
+    for _ in range(2):
+        await deliver()
     [persisted] = store.list_items(parent.id, type=item_type).data
     assert persisted.data.subagent_return_id == return_id
     if late:

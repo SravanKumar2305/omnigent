@@ -355,6 +355,7 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
 )
 from omnigent.server.subagent_activity import (
+    claude_subagent_completion_markers,
     record_claude_subagent_return,
     record_subagent_activity,
 )
@@ -2818,7 +2819,7 @@ async def _persist_external_conversation_item_unlocked(
     # back deduplicated and its queue entries are unheld.
     try:
         skipped_new_items = _build_skipped_native_items(session_id, conv, skipped_pending)
-        batch = [*skipped_new_items, item]
+        batch = [*skipped_new_items, item, *claude_subagent_completion_markers(item)]
         pending_background_title = prepare_background_session_title(
             coordinator=background_title_coordinator,
             conversation=conv,
@@ -2834,7 +2835,7 @@ async def _persist_external_conversation_item_unlocked(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
         raise
-    persisted = persisted_items[-1]
+    persisted = persisted_items[len(skipped_new_items)]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
@@ -2842,6 +2843,7 @@ async def _persist_external_conversation_item_unlocked(
         _restore_drained_inputs(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
+        await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
@@ -2864,9 +2866,10 @@ async def _persist_external_conversation_item_unlocked(
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
-    await _publish_persisted_external_item(
-        session_id, body, persisted, conversation_store, cleared_pending_id=cleared_pending_id
+    _publish_persisted_external_item(
+        session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
+    await record_claude_subagent_return(session_id, persisted, conversation_store)
     return persisted.id
 
 
@@ -2911,11 +2914,10 @@ def _new_external_conversation_item(
     return item
 
 
-async def _publish_persisted_external_item(
+def _publish_persisted_external_item(
     session_id: str,
     body: SessionEventInput,
     persisted: ConversationItem,
-    conversation_store: ConversationStore,
     cleared_pending_id: str | None = None,
 ) -> None:
     """Broadcast a newly persisted external item and drive any elicitation it resolves."""
@@ -2927,10 +2929,6 @@ async def _publish_persisted_external_item(
         message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
-    if (isinstance(persisted.data, MessageData) and persisted.data.is_meta) or (
-        isinstance(persisted.data, FunctionCallOutputData) and persisted.data.subagent_return_id
-    ):
-        await record_claude_subagent_return(session_id, persisted, conversation_store)
 
 
 async def _persist_external_conversation_items(
@@ -2955,12 +2953,18 @@ async def _persist_external_conversation_items(
         except Exception as exc:  # noqa: BLE001 — re-raised once the valid prefix is applied
             error = exc
             break
+    markers = [marker for item in items for marker in claude_subagent_completion_markers(item)]
     persisted_items = (
-        await asyncio.to_thread(conversation_store.append, session_id, items) if items else []
+        (await asyncio.to_thread(conversation_store.append, session_id, [*items, *markers]))[
+            : len(items)
+        ]
+        if items
+        else []
     )
     for body, persisted in zip(bodies[: len(items)], persisted_items, strict=True):
         if not persisted.deduplicated:
-            await _publish_persisted_external_item(session_id, body, persisted, conversation_store)
+            _publish_persisted_external_item(session_id, body, persisted)
+        await record_claude_subagent_return(session_id, persisted, conversation_store)
     if error is not None:
         raise error
     return [persisted.id for persisted in persisted_items]
@@ -3517,7 +3521,11 @@ async def _mark_runner_sessions_offline_impl(
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
+        turn_id = _session_active_response_cache.get(conv.id)
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        await record_subagent_activity(
+            conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
+        )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
 
 
@@ -7383,11 +7391,15 @@ async def _relay_runner_stream(
                     code="runner_disconnected",
                     message="Runner disconnected unexpectedly.",
                 )
+                turn_id = _session_active_response_cache.get(session_id)
                 _publish_status(
                     session_id,
                     "failed",
                     disconnect_error,
                     failure_origin="runner_disconnected_mid_turn",
+                )
+                await record_subagent_activity(
+                    session_id, "returned", conversation_store, turn_id=turn_id, status="failed"
                 )
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session
@@ -7680,6 +7692,8 @@ async def _relay_runner_stream_once(
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
+                            # Keep the turn identity across transport retries until final status.
+                            _session_active_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")
                         failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:

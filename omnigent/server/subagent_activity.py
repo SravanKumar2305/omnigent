@@ -166,7 +166,7 @@ async def record_subagent_activity(
                     for row in latest.data
                     if (
                         isinstance(row.data, MessageData)
-                        and row.data.role == "assistant"
+                        and (row.data.role == "assistant" or status == "failed")
                         and not row.data.is_meta
                     )
                     or row.type in {"function_call", "function_call_output"}
@@ -174,7 +174,10 @@ async def record_subagent_activity(
                 None,
             )
             if turn_id is None:
-                return
+                if status != "failed":
+                    return
+                # A runner can die before producing any transcript for its first turn.
+                turn_id = child.id
         key = f"{child.id}:{phase}:{turn_id or ''}"
         stable_id = hashlib.sha256(key.encode()).hexdigest()[:32]
         item = NewConversationItem(
@@ -256,6 +259,18 @@ def _claude_completion_ids(
     return task_ids, call_ids
 
 
+def claude_subagent_completion_markers(
+    item: NewConversationItem | ConversationItem,
+) -> list[NewConversationItem]:
+    """Build stable markers to commit in the same transaction as the result."""
+    task_ids, call_ids = _claude_completion_ids(item)
+    return [
+        _completion_marker(kind, native_id, status)
+        for kind, completions in (("task", task_ids), ("call", call_ids))
+        for native_id, status in completions.items()
+    ]
+
+
 async def _record_claude_subagent_return(
     parent_id: str,
     item: NewConversationItem | ConversationItem,
@@ -264,12 +279,6 @@ async def _record_claude_subagent_return(
     task_ids, call_ids = _claude_completion_ids(item)
     if not task_ids and not call_ids:
         return
-    markers = [
-        _completion_marker(kind, native_id, status)
-        for kind, completions in (("task", task_ids), ("call", call_ids))
-        for native_id, status in completions.items()
-    ]
-    await asyncio.to_thread(store.append, parent_id, markers)
     after: str | None = None
     while True:
         page = await asyncio.to_thread(
