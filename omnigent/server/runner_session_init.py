@@ -212,11 +212,12 @@ class RunnerSessionInitializer:
                     extra=debug_event(
                         "runner_session_init_failed",
                         stage="session_init",
-                        # The request rides the runner's tunnel, so a dropped
-                        # connection is the runner going away, not an upstream.
+                        # The request rides the runner's tunnel: a closed tunnel
+                        # (ConnectionError) or offline runner (httpx.ConnectError)
+                        # is the runner going away, not an upstream.
                         error_category=(
                             ErrorCategory.RUNNER.value
-                            if isinstance(exc, ConnectionError)
+                            if isinstance(exc, (ConnectionError, httpx.TransportError))
                             else None
                         ),
                     ),

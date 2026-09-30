@@ -267,9 +267,19 @@ def test_classify_exception_arbitrary_is_unknown() -> None:
     )
 
 
-def test_classify_exception_disk_full_is_blocking_host() -> None:
-    """A full disk is the host machine's fault, e.g. a runner log or bridge dir."""
-    exc = OSError(errno.ENOSPC, "No space left on device", "/home/x/.omnigent/logs/r.log")
+@pytest.mark.parametrize(
+    "code",
+    [
+        errno.ENOSPC,
+        pytest.param(
+            getattr(errno, "EDQUOT", None),
+            marks=pytest.mark.skipif(not hasattr(errno, "EDQUOT"), reason="POSIX-only errno"),
+        ),
+    ],
+)
+def test_classify_exception_disk_full_is_blocking_host(code: int) -> None:
+    """A full disk or quota is the host machine's fault, e.g. a runner log or bridge dir."""
+    exc = OSError(code, "No space left on device", "/home/x/.omnigent/logs/r.log")
     assert classify_exception(exc) == (ErrorCategory.HOST, ErrorImpact.BLOCKING)
 
 

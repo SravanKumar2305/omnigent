@@ -857,6 +857,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     launch_error: str,
     expected_fragments: tuple[str, ...],
     wrapper_command: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A deterministic host relaunch refusal persists user msg + error.
 
@@ -890,6 +891,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
         "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
         0.0,
     )
+    caplog.set_level(logging.WARNING)
 
     comm = await _connect_host(app)
     agent = await create_test_agent(
@@ -930,6 +932,16 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     finally:
         await relaunch_responder
         set_runner_client(None)
+
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Mapped codes carry their owner; uncoded or unmapped ones are left to the
+    # host's own row.
+    expected_category = {
+        HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
+        WORKSPACE_MISSING_ERROR_CODE: "user",
+    }.get(launch_error_code or "")
+    assert refusal.attributes.get("error_category") == expected_category
+    assert refusal.attributes["error_impact"] == "blocking"
 
     if expected_error_code is None:
         # Unknown host categories may contain arbitrary runner output and

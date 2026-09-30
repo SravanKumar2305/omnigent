@@ -1548,6 +1548,15 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     # duplicate arbitrary runner output into the daemon log or foreground.
     assert "runner process exited with code 7" in caplog.text
     assert "RuntimeError: boom-traceback" not in caplog.text
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    # The runner itself died, unlike a host-side spawn failure.
+    assert failure.attributes["error_category"] == "runner"
+    assert failure.attributes["error_impact"] == "blocking"
+    assert failure.attributes["error_phase"] == "runner_launch"
     output = capsys.readouterr().out
     assert "Runner launch failed" in output
     assert "runner process exited with code 7" in output

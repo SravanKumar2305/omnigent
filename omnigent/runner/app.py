@@ -3467,20 +3467,19 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_required_terminal_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_required_terminal_error(
+        event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
+    ) -> dict[str, str]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
         REPL and older clients render it verbatim). When the failure is
         recognized, also carries ``title`` / ``cause`` / ``remediation`` so the
         web UI can render a friendly card instead of the raw enum + blob.
+
+        :param event: The required terminal's exit event.
+        :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
-        # Classify once; the message formatter reuses the same diagnosis.
-        diagnosis = classify_terminal_failure(
-            command=event.command,
-            exit_status=event.exit_status,
-            output=event.last_output,
-        )
         message = _format_required_terminal_exit_output(event, diagnosis)
         error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
@@ -3588,7 +3587,13 @@ def create_runner_app(
         # Record the exit before releasing the harness: the release severs any
         # in-flight turn stream, whose failure handler then reports this exit
         # instead of the transport error the severed socket raises.
-        error = _build_required_terminal_error(event)
+        # Classify once; the error card and the failure log share the diagnosis.
+        diagnosis = classify_terminal_failure(
+            command=event.command,
+            exit_status=event.exit_status,
+            output=event.last_output,
+        )
+        error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
@@ -3628,9 +3633,6 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        diagnosis = classify_terminal_failure(
-            command=event.command, exit_status=event.exit_status, output=event.last_output
-        )
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
