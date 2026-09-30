@@ -16,6 +16,7 @@ from omnigent.harnesses.claude_native import bridge
     ("scenario", "verification", "outcome"),
     [
         ("normal", "draft_absent", "returned"),
+        ("unknown_command", "draft_absent", "returned"),
         ("blank_line", "unverified", "returned"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
@@ -35,6 +36,8 @@ def test_delivery_diagnostics(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     secret = "private customer prompt"
+    if scenario == "unknown_command":
+        secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
     pane = "❯ "
@@ -72,6 +75,8 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    if scenario == "unknown_command":
+        monkeypatch.setattr(bridge, "_unknown_command_rejection_appeared", lambda *_a, **_k: True)
     monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.03)
     monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
@@ -102,6 +107,10 @@ def test_delivery_diagnostics(
     assert secret not in json.dumps(rows)
     assert secret not in caplog.text
     assert rows[-1]["attributes"]["verification"] == verification
+
+    if scenario == "unknown_command":
+        assert enters == 2
+        assert records[-1].attributes["attempt"] == 2
 
     if scenario == "blank_line":
         warning = next(r for r in records if r.event_name == "claude_native_submit_unverified")
