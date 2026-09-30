@@ -1,5 +1,5 @@
-import { renderSidebar } from "./sidebarTestHelpers";
-import { conversation as conv, conversationPage } from "./sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -25,7 +25,7 @@ vi.mock("@/hooks/useProjectOrder", () => ({
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return { ...conversationHooksMock(), useProjects: vi.fn(() => ({ data: [] })) };
 });
 

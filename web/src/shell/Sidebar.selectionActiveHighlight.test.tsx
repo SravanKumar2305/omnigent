@@ -1,4 +1,4 @@
-import { conversationPage } from "./sidebarMockHelpers";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -20,7 +20,7 @@ import type { Session } from "@/lib/types";
 import { type OmnigentLinkProps, reactRouterRouting, RoutingProvider } from "@/lib/routing";
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return conversationHooksMock();
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));

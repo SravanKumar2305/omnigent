@@ -5,7 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-import { Sidebar } from "./Sidebar";
+import { Sidebar } from "@/shell/Sidebar";
 
 export function renderSidebar(
   props: { open?: boolean; onClose?: () => void; route?: string } = {},

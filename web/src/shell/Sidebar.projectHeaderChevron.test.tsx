@@ -1,5 +1,5 @@
-import { renderSidebar as renderSidebarAt } from "./sidebarTestHelpers";
-import { conversationPage } from "./sidebarMockHelpers";
+import { renderSidebar as renderSidebarAt } from "@/test/sidebarTestHelpers";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -20,7 +20,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
     useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),

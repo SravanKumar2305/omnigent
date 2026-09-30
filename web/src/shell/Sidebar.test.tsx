@@ -84,7 +84,7 @@ vi.mock("@/hooks/useHosts", () => ({
 // Mutation hooks are only invoked on row actions; stub them. useConversations
 // is the data source under test, so it's a controllable mock.
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
     usePinnedConversations: () => {

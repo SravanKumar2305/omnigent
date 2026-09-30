@@ -76,7 +76,7 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
     usePinnedConversations: () => {

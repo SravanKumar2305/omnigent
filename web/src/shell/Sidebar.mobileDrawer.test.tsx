@@ -1,5 +1,5 @@
-import { renderSidebar } from "./sidebarTestHelpers";
-import { conversation as conv, conversationPage } from "./sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 // Behaviour tests for the mobile sidebar drawer shape: it stops short of the
 // right edge so a strip of the chat stays visible, tapping that strip dismisses
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return conversationHooksMock();
 });
 

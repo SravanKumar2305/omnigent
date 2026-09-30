@@ -1,5 +1,5 @@
-import { renderSidebar } from "./sidebarTestHelpers";
-import { conversationPage } from "./sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 // Tests for the read-state actions in the sidebar's session menus:
 //   1. A row's kebab always offers exactly one read-state action — "Mark as
 //      unread" on a read row, "Mark as read" on a row already showing the
@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return conversationHooksMock();
 });
 

@@ -1,4 +1,4 @@
-import { conversation as conv, conversationPage } from "./sidebarMockHelpers";
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Behaviour tests for the peek card's entry window: while the card is still
 // fading in it is (nearly) invisible yet already covers the header toggle
@@ -15,7 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("./sidebarMockHelpers");
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return conversationHooksMock();
 });
 

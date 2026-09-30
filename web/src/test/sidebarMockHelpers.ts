@@ -1,6 +1,8 @@
 /** Default hook stubs and data builders for Sidebar component tests. */
 import { vi } from "vitest";
 import type { Conversation, useConversations } from "@/hooks/useConversations";
+import type { SidebarListQuery } from "@/hooks/useSidebarData";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 
 export function conversationHooksMock() {
   return {
@@ -42,7 +44,7 @@ export function conversationHooksMock() {
     useProjectConfig: () => ({ data: undefined, isLoading: false }),
     useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     fetchProjectSessionIds: () => Promise.resolve([]),
-    PROJECT_LABEL_KEY: "omni_project",
+    PROJECT_LABEL_KEY,
   };
 }
 
@@ -74,10 +76,11 @@ export function conversationPage(
     },
     isLoading: false,
     isError: false,
+    isFetching: false,
     error: null,
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
-  } satisfies Partial<ReturnType<typeof useConversations>>;
+  } satisfies SidebarListQuery;
   return result as unknown as ReturnType<typeof useConversations>;
 }
