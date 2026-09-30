@@ -19,7 +19,11 @@ const {
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
 const { isDatabricksOAuthServerUrl } = require("./url");
-const { cookieMatchesOrigin } = require("./databricks-auth");
+const {
+  cookieMatchesOrigin,
+  isTransientRenewalError,
+  IP_ACL_BLOCKED,
+} = require("./databricks-auth");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
 // Bound on the session-create request so a stalled socket can't hang connect.
@@ -29,20 +33,19 @@ const NETWORK_TIMEOUT_MS = 20_000;
  * Ensure ``ses`` holds a live DBAUTH cookie for a workspace, and return that
  * workspace origin. Two entry points with deliberately different behavior:
  *
- * - Explicit connect/login (``interactive: true``): ALWAYS authenticate fresh —
- *   never silently reuse a stored token. So a new window connecting to a SPOG
- *   URL re-runs the account flow + picker (choosing the workspace for THIS
- *   window) instead of dropping into another window's workspace. A workspace URL
- *   re-authenticates directly (usually a silent browser SSO round-trip). The
- *   result is persisted keyed by the resolved workspace origin.
+ * - Explicit connect/login (``interactive: true``): try the stored credentials
+ *   for the entered origin (unless ``useStoredCredentials: false``), else
+ *   authenticate fresh in the browser. Tokens are keyed by WORKSPACE origin, so a
+ *   SPOG URL still re-runs the account flow + picker for THIS window. The result
+ *   is persisted keyed by the resolved workspace origin.
  * - Restore/renewal (``interactive: false``): reuse the stored token for this
  *   (already-resolved) workspace, refreshing if needed, and re-mint the cookie
- *   against the SAME workspace — no browser, no picker. This is the ONLY path
- *   that reads the cache, including relaunch and additional windows.
+ *   against the SAME workspace — no browser, no picker.
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
- * @param {{ interactive?: boolean, nextPath?: string, workspaceId?: string, signal?: AbortSignal,
+ * @param {{ interactive?: boolean, useStoredCredentials?: boolean, nextPath?: string,
+ *   workspaceId?: string, signal?: AbortSignal,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
  *   ``workspaceId`` (from a ``?o=`` hint) auto-selects that workspace for an
@@ -52,7 +55,14 @@ const NETWORK_TIMEOUT_MS = 20_000;
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", pickWorkspace, workspaceId, signal } = {},
+  {
+    interactive = true,
+    useStoredCredentials = true,
+    nextPath = "/omnigent",
+    pickWorkspace,
+    workspaceId,
+    signal,
+  } = {},
 ) {
   signal?.throwIfAborted();
   if (!isDatabricksOAuthServerUrl(origin)) {
@@ -63,6 +73,16 @@ async function ensureDatabricksSession(
     interactive,
     workspaceHint: workspaceId ?? null,
   });
+  if (interactive && useStoredCredentials) {
+    try {
+      return await ensureDatabricksSession(ses, origin, { interactive: false, nextPath, signal });
+    } catch (error) {
+      signal?.throwIfAborted();
+      // A browser sign-in can't finish while the workspace is unreachable either.
+      if (isTransientRenewalError(error)) throw error;
+      console.log("[omnigent] databricks session: stored credentials unusable", { origin });
+    }
+  }
   let bridgeOrigin;
   let accessToken;
 
@@ -288,6 +308,9 @@ async function mintSessionCookie(
         if (typeof code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(code)) errorCode = code;
       } catch {
         /* HTML and unstructured errors are not displayed. */
+      }
+      if (status === 403 && /is blocked by Databricks IP ACL/.test(errorBody)) {
+        errorCode = IP_ACL_BLOCKED;
       }
       const details = [errorCode, requestId && `request ID ${requestId}`]
         .filter(Boolean)

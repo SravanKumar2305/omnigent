@@ -52,6 +52,32 @@ function cookieMatchesOrigin(cookie, origin) {
   );
 }
 
+// The workspace rejected a freshly minted session / its IP access list refused session-create.
+const SESSION_REJECTED = "SESSION_REJECTED";
+const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
+const sessionRejected = (message) =>
+  Object.assign(new Error(message), { errorCode: SESSION_REJECTED });
+const SESSION_TRANSPORT_ERRORS = new Set([
+  "Databricks session creation timed out",
+  "Databricks session response aborted",
+  "Databricks session response closed before completion",
+]);
+
+/** Whether a renewal failure is worth retrying: no response, HTTP 5xx/429, or an IP ACL block. */
+function isTransientRenewalError(error) {
+  if (!error || typeof error !== "object") return false;
+  if (error.errorCode === IP_ACL_BLOCKED) return true;
+  const { status } = error;
+  if (status != null) return status === 429 || (status >= 500 && status <= 599);
+  const message = typeof error.message === "string" ? error.message : "";
+  return (
+    error.name === "TimeoutError" ||
+    (error.name === "TypeError" && (message === "fetch failed" || message === "terminated")) ||
+    message.startsWith("net::ERR_") ||
+    SESSION_TRANSPORT_ERRORS.has(message)
+  );
+}
+
 /** One session owns the request guard; each window owns its renewal lifecycle. */
 function createDatabricksAuth({
   session,
@@ -111,7 +137,7 @@ function createDatabricksAuth({
   function fail(ctx, error) {
     if (!current(ctx)) return;
     rejectConnection(ctx.win);
-    onAuthRequired(ctx.win, ctx.serverUrl, error);
+    onAuthRequired(ctx.win, ctx.serverUrl, error, { returnUrl: ctx.returnUrl });
   }
 
   async function schedule(ctx) {
@@ -184,7 +210,7 @@ function createDatabricksAuth({
     if (!ctx.pending && now() - ctx.lastRejectedAt < 15_000) {
       fail(
         ctx,
-        new Error("Databricks rejected the renewed session; sign in again in your browser"),
+        sessionRejected("Databricks rejected the renewed session; sign in again in your browser"),
       );
       return;
     }
@@ -218,7 +244,7 @@ function createDatabricksAuth({
         if (isDatabricksLoginUrl(url, origin)) {
           fail(
             ctx,
-            new Error("Workspace authentication is required; sign in again in your browser"),
+            sessionRejected("Workspace authentication is required; sign in again in your browser"),
           );
           return;
         }
@@ -314,5 +340,8 @@ module.exports = {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   cookieMatchesOrigin,
+  isTransientRenewalError,
+  SESSION_REJECTED,
+  IP_ACL_BLOCKED,
   createDatabricksAuth,
 };

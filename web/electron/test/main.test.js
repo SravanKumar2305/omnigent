@@ -33,6 +33,90 @@ const urlHelpers = require("../src/url");
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
+/** A fake workspace behind the real databricks-session module: `verdict` answers session-create. */
+function createWorkspaceNetwork(origin) {
+  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0 };
+  let jar = [];
+  const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
+  // Chromium removes the old cookie before inserting its replacement.
+  const setJar = (next, cause) => {
+    for (const old of jar) cookies.emit("changed", {}, old, cause, true);
+    jar = next;
+    for (const cookie of next) cookies.emit("changed", {}, cookie, "explicit", false);
+  };
+  network.cookies = cookies;
+  network.removeCookie = () => setJar([], "explicit");
+  const respond = (request, status, body) => {
+    const res = Object.assign(new EventEmitter(), { statusCode: status, headers: {} });
+    request.emit("response", res);
+    if (body) res.emit("data", JSON.stringify(body));
+    res.emit("end");
+  };
+  const verdicts = {
+    // 302 to next_url; following it commits DBAUTH and lands on the app.
+    allow(request) {
+      request.followRedirect = () => {
+        const expirationDate = Date.now() / 1000 + 3600;
+        setJar([{ name: "DBAUTH", domain: new URL(origin).hostname, expirationDate }], "overwrite");
+        respond(request, 200);
+      };
+      const next = new URL(request.url).searchParams.get("next_url");
+      request.emit("redirect", 302, "GET", new URL(next, origin).href, {});
+    },
+    blocked: (request) =>
+      respond(request, 403, {
+        error_code: "403",
+        message: "Source IP address: 203.0.113.7 is blocked by Databricks IP ACL for workspace: 1",
+      }),
+    forbidden: (request) => respond(request, 403, { error_code: "PERMISSION_DENIED" }),
+  };
+  const net = {
+    request: ({ url }) =>
+      Object.assign(new EventEmitter(), {
+        url,
+        setHeader() {},
+        abort() {},
+        end() {
+          setImmediate(() => {
+            network.sessionCreates++;
+            verdicts[network.verdict](this);
+          });
+        },
+      }),
+  };
+  const oauth = {
+    isTrustedDatabricksOrigin: urlHelpers.isDatabricksOAuthServerUrl,
+    getValidStoredToken: async () => "token",
+    runInteractiveLogin: async () => {
+      network.browserSignIns++;
+      throw new Error("browser sign-in is not expected");
+    },
+    saveWorkspaceToken() {},
+  };
+  const file = path.join(__dirname, "../src/databricks-session.js");
+  const realRequire = createRequire(file);
+  const fakes = {
+    electron: { net },
+    "./databricks-oauth": oauth,
+    "./databricks-account": { parseAccountFromToken: () => null },
+  };
+  const module = { exports: {} };
+  vm.runInNewContext(
+    fs.readFileSync(file, "utf8"),
+    {
+      module,
+      URL,
+      setTimeout,
+      clearTimeout,
+      console: { log() {}, warn() {} },
+      require: (specifier) => fakes[specifier] ?? realRequire(specifier),
+    },
+    { filename: file },
+  );
+  network.ensureDatabricksSession = module.exports.ensureDatabricksSession;
+  return network;
+}
+
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
@@ -44,6 +128,10 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
+  loadURL = async () => {},
+  internalFeatures = false,
+  // A createWorkspaceNetwork() to run the real session module against.
+  network = null,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -76,7 +164,7 @@ function loadNavigationHarness({
     ],
   });
   const defaultSession = {
-    cookies,
+    cookies: network?.cookies ?? cookies,
     webRequest: {
       onBeforeRequest: (fn) => {
         webRequest.beforeRequest = fn;
@@ -116,6 +204,7 @@ function loadNavigationHarness({
     getURL: () => currentUrl,
     setWindowOpenHandler: () => {},
   };
+  const winListeners = new Map();
   const win = {
     webContents,
     contentView: { addChildView: () => {}, removeChildView: () => {} },
@@ -125,14 +214,19 @@ function loadNavigationHarness({
     getPosition: () => [0, 0],
     setPosition: () => {},
     maximize: () => {},
-    on: () => {},
+    on: (eventName, listener) => {
+      if (!winListeners.has(eventName)) winListeners.set(eventName, []);
+      winListeners.get(eventName).push(listener);
+    },
     loadFile: (...args) => {
       calls.loadFile.push(args);
+      currentUrl = `file://${args[0]}?${args[1]?.search ?? ""}`;
       return Promise.resolve();
     },
     loadURL: (...args) => {
       calls.loadURL.push(args);
-      return Promise.resolve();
+      currentUrl = args[0];
+      return loadURL(...args);
     },
   };
 
@@ -201,7 +295,9 @@ function loadNavigationHarness({
     screen: {},
     session: { defaultSession },
     shell: {},
-    systemPreferences: {},
+    systemPreferences: internalFeatures
+      ? { getUserDefault: (key) => key === "databricksInternalFeaturesEnabled" }
+      : {},
   };
 
   const localRequires = {
@@ -249,7 +345,7 @@ function loadNavigationHarness({
     "./databricks-session": {
       ensureDatabricksSession: (...args) => {
         calls.auth.push(args);
-        return ensureSession(...args);
+        return (network?.ensureDatabricksSession ?? ensureSession)(...args);
       },
     },
     "./databricks-oauth": {
@@ -314,7 +410,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -328,7 +424,11 @@ function loadNavigationHarness({
     clearTimeout,
     console,
     module,
-    process: { ...process, env: { ...process.env } },
+    process: {
+      ...process,
+      platform: internalFeatures ? "darwin" : process.platform,
+      env: { ...process.env },
+    },
     require: (specifier) => {
       if (specifier === "electron") return electron;
       if (specifier === "electron-updater") return { autoUpdater: {} };
@@ -363,6 +463,9 @@ function loadNavigationHarness({
     settingsPath: path.join(userData, "settings.json"),
     pickers,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
+    emitWindow: (eventName) => {
+      for (const listener of winListeners.get(eventName) ?? []) listener();
+    },
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
       currentUrl = url;
@@ -504,6 +607,79 @@ describe("Databricks auth mode wiring", () => {
     assert.equal(params.get("error"), "Couldn't sign in to Databricks. Please try again.");
     assert.equal(params.get("url"), workspace);
   });
+
+  it("signs in through the browser on the next Connect after a rejected session", async (t) => {
+    let rejected = false;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin) => {
+        if (rejected) return origin;
+        rejected = true;
+        throw Object.assign(new Error("rejected"), { errorCode: "SESSION_REJECTED" });
+      },
+    });
+    t.after(h.cleanup);
+    const connect = () => h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    await assert.rejects(connect(), /rejected/);
+    await connect();
+    await connect();
+    assert.deepEqual(
+      h.calls.auth.map((call) => call[2].useStoredCredentials),
+      [true, false, true],
+    );
+  });
+
+  const offline = () => new TypeError("fetch failed");
+  const ipAclBlocked = () => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
+  const [cant, couldnt, blocked] = [
+    "Can't reach Databricks.",
+    "Couldn't reach Databricks.",
+    "Databricks blocked this network.",
+  ];
+  const vpn = "Check that you're connected to the VPN";
+  const network = "Check your network connection";
+  const allowed = "Connect from a network the workspace allows";
+  // [managed device, renewal failure (null: unreachable page load), retrying, final message]
+  for (const [internalFeatures, failure, retrying, final] of [
+    [true, offline, `${cant} ${vpn}`, `${couldnt} ${vpn}`],
+    [false, offline, `${cant} ${network}`, `${couldnt} ${network}`],
+    [true, ipAclBlocked, `${blocked} ${vpn}`, `${blocked} ${vpn}`],
+    [false, ipAclBlocked, `${blocked} ${allowed}`, `${blocked} ${allowed}`],
+    [true, null, `${cant} ${vpn}`, `${couldnt} ${vpn}`],
+    [false, null, `${cant} ${network}`, `${couldnt} ${network}`],
+  ]) {
+    it(`shows "${retrying}" while retrying, then "${final}"`, async (t) => {
+      const shown = [];
+      // An empty schedule means retries ran out.
+      for (const retries of [[20], []]) {
+        const h = loadNavigationHarness({
+          serverUrl: workspace,
+          databricksMode: "browser",
+          internalFeatures,
+          ensureSession: async () => {
+            throw failure();
+          },
+        });
+        t.after(h.cleanup);
+        h.api.setReconnectDelaysMs(retries);
+        if (failure) {
+          // oxlint-disable-next-line no-await-in-loop
+          await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+        } else h.emit("did-fail-load", -105, "ERR", `${workspace}/c/1`, true);
+        // oxlint-disable-next-line no-await-in-loop
+        await tick();
+        // Leaving the retrying page stops the pending reconnect.
+        h.setUrl("about:blank");
+        const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+        shown.push([params.get("error"), params.get("reconnect")]);
+      }
+      assert.deepEqual(shown, [
+        [`${retrying}. Retrying automatically…`, "1"],
+        [`${final}, then click Connect.`, null],
+      ]);
+    });
+  }
 
   it("prepares stored credentials on saved-server launch and deep-link loads", async (t) => {
     const h = loadNavigationHarness({
@@ -1659,6 +1835,269 @@ describe("HTTP error status fallback (src/main.js)", () => {
     aborted.emit("did-fail-load", -3, "ABORTED", "https://host.example/ml/omnigents/", true);
     await flush();
     assert.deepEqual(aborted.calls.loadFile, []);
+  });
+});
+
+// While a Databricks workspace is unreachable (e.g. VPN reconnecting after wake),
+// browser-auth windows show setup and keep reconnecting silently in the background.
+describe("Databricks reconnect from setup (src/main.js)", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const origin = new URL(workspace).origin;
+  const page = `${workspace}/c/conv_1?tab=chat`;
+  const wait = (ms = 10) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  const failLoad = (h, url = page, code = -105, desc = "ERR_NAME_NOT_RESOLVED") =>
+    h.emit("did-fail-load", code, desc, url, true);
+  const setupParams = (h, index = -1) =>
+    Object.fromEntries(new URLSearchParams(h.calls.loadFile.at(index)[1].search));
+
+  function browserHarness(t, delays, options = {}) {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ...options,
+    });
+    t.after(h.cleanup);
+    h.api.setReconnectDelaysMs(delays);
+    return h;
+  }
+
+  it("retries an unreachable page load from setup until the page reopens", async (t) => {
+    let loads = 0;
+    const h = browserHarness(t, [25, 25], {
+      loadURL: async (url) => {
+        if (loads++ > 0) return;
+        failLoad(h, url);
+        throw new Error("ERR_NAME_NOT_RESOLVED (-105) loading url");
+      },
+    });
+    failLoad(h);
+    await wait(10);
+    assert.deepEqual(setupParams(h), {
+      error: "Can't reach Databricks. Check your network connection. Retrying automatically…",
+      url: `${origin}/`,
+      reconnect: "1",
+    });
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    await wait(100);
+    // The first silent retry failed to load as well; the second reopened the page.
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.equal(h.calls.loadFile.length, 2);
+    assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+  });
+
+  it("returns a failed deep link to its conversation", async (t) => {
+    let first = true;
+    const h = browserHarness(t, [25], {
+      ensureSession: async (_ses, sessionOrigin) => {
+        if (!first) return sessionOrigin;
+        first = false;
+        throw new TypeError("fetch failed");
+      },
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, "/c/conv_1"));
+    await wait(50);
+    assert.deepEqual(h.calls.loadURL, [[`${workspace}/c/conv_1`]]);
+  });
+
+  it("stops when the window leaves the retrying setup page or closes", async (t) => {
+    const left = browserHarness(t, [40]);
+    const closed = browserHarness(t, [40]);
+    closed.api.createWindow(workspace);
+    await wait(10);
+    failLoad(left);
+    failLoad(closed, workspace);
+    await wait(10);
+    left.setUrl(`file://${left.api.SETUP_PAGE}?url=${encodeURIComponent(workspace)}`);
+    closed.emitWindow("closed");
+    await wait(70);
+    assert.deepEqual(left.calls.loadURL, []);
+    // Only the window's own initial load ran.
+    assert.deepEqual(closed.calls.loadURL, [[workspace]]);
+  });
+
+  it("does not retry credential failures", async (t) => {
+    const h = browserHarness(t, [25], {
+      ensureSession: async () => {
+        throw Object.assign(new Error("expired with no refresh token"), {
+          errorCode: "NO_REFRESH_TOKEN",
+        });
+      },
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await wait(50);
+    assert.equal(h.calls.auth.length, 1);
+    assert.deepEqual(setupParams(h), {
+      error: "Session expired. Connect to sign in again.",
+      url: workspace,
+    });
+  });
+
+  it("goes straight to setup for other windows and non-network errors", async (t) => {
+    const embedded = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "embedded",
+      internalFeatures: true,
+    });
+    t.after(embedded.cleanup);
+    embedded.api.setReconnectDelaysMs([1]);
+    failLoad(embedded);
+
+    const local = loadNavigationHarness({ serverUrl: "http://127.0.0.1:8000/" });
+    t.after(local.cleanup);
+    local.api.setReconnectDelaysMs([1]);
+    failLoad(local, "http://127.0.0.1:8000/");
+
+    const redirects = browserHarness(t, [1]);
+    failLoad(redirects, page, -310, "ERR_TOO_MANY_REDIRECTS");
+    await wait(20);
+
+    for (const h of [embedded, local, redirects]) {
+      assert.deepEqual(h.calls.loadURL, []);
+      assert.deepEqual(h.calls.auth, []);
+      assert.equal(h.calls.loadFile.length, 1);
+      assert.equal(setupParams(h).reconnect, undefined);
+    }
+    assert.equal(setupParams(embedded).error, "ERR_NAME_NOT_RESOLVED (-105)");
+    assert.equal(setupParams(redirects).error, "ERR_TOO_MANY_REDIRECTS (-310)");
+  });
+});
+
+// The real session bridge and renewal lifecycle against a faked workspace: off the
+// VPN, the workspace IP access list refuses session-create.
+describe("VPN drop and reconnect against faked workspace responses (src/main.js)", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const origin = new URL(workspace).origin;
+  const blocked = "Databricks blocked this network. Check that you're connected to the VPN";
+  const wait = (ms) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  async function until(condition, label, deadline = Date.now() + 1000) {
+    if (condition()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+    await wait(2);
+    await until(condition, label, deadline);
+  }
+  const shown = (h) => Object.fromEntries(new URL(h.webContents.getURL()).searchParams);
+
+  async function connected(t, delays) {
+    const network = createWorkspaceNetwork(origin);
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      network,
+    });
+    t.after(h.cleanup);
+    h.api.setReconnectDelaysMs(delays);
+    await h.api.loadServerUrl(h.win, workspace, "/c/123");
+    assert.deepEqual(h.calls.loadURL, [[`${workspace}/c/123`]]);
+    return { h, network };
+  }
+
+  const loginRedirect = (h) =>
+    h.webRequest.beforeRequest(
+      {
+        webContentsId: h.webContents.id,
+        url: `${origin}/login?next_url=%2Fomnigent`,
+        resourceType: "mainFrame",
+      },
+      () => {},
+    );
+  for (const [trigger, drop, vpnReturns] of [
+    ["the session cookie is removed", (_h, network) => network.removeCookie(), true],
+    ["the workspace redirects to login", loginRedirect, true],
+    ["the session cookie is removed", (_h, network) => network.removeCookie(), false],
+  ]) {
+    const outcome = vpnReturns ? "reconnects by itself when the VPN returns" : "gives up";
+    it(`${outcome} after ${trigger} off the VPN`, async (t) => {
+      const { h, network } = await connected(t, [30, 30, 30]);
+      h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+      network.verdict = "blocked";
+      drop(h, network);
+      await until(() => h.calls.loadFile.length === 1, "the retrying setup page");
+      assert.deepEqual(shown(h), {
+        error: `${blocked}. Retrying automatically…`,
+        url: workspace,
+        reconnect: "1",
+      });
+      assert.equal(h.api.windows.get(h.win).origin, null);
+      // Connect, the blocked renewal, then one blocked background retry.
+      await until(() => network.sessionCreates === 3, "a blocked retry");
+      if (vpnReturns) {
+        network.verdict = "allow";
+        await until(() => h.calls.loadURL.length === 2, "the reconnect");
+        // Back on the page the user was on; failed retries never reloaded the setup page.
+        assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+        assert.equal(h.api.windows.get(h.win).origin, origin);
+        assert.equal(h.calls.loadFile.length, 1);
+      } else {
+        await until(() => h.calls.loadFile.length === 2, "the final setup page");
+        assert.deepEqual(shown(h), { error: `${blocked}, then click Connect.`, url: workspace });
+      }
+      const settled = network.sessionCreates;
+      await wait(100);
+      assert.equal(network.sessionCreates, settled);
+      assert.equal(h.calls.loadURL.length, vpnReturns ? 2 : 1);
+      assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
+      assert.equal(network.browserSignIns, 0);
+    });
+  }
+
+  it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
+    const { h, network } = await connected(t, [30, 30, 30]);
+    h.api.registerIpc();
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.calls.loadFile.length === 1, "the retrying setup page");
+
+    const setupEvent = {
+      sender: h.webContents,
+      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    };
+    await assert.rejects(
+      h.ipc.get("omnigent:set-server-url")(setupEvent, workspace, { requestId: "connect" }),
+      /HTTP 403: IP_ACL_BLOCKED/,
+    );
+    await until(() => h.calls.loadFile.length === 2, "the setup page after Connect");
+    assert.deepEqual(shown(h), {
+      error: `${blocked}. Retrying automatically…`,
+      url: workspace,
+      reconnect: "1",
+    });
+    // The loop restarted: another blocked background attempt follows Connect.
+    await until(() => network.sessionCreates === 4, "a blocked retry after Connect");
+
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    assert.deepEqual(h.calls.loadURL.at(-1), [workspace]);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+    await wait(80);
+    assert.equal(network.sessionCreates, 5);
+    assert.deepEqual(
+      h.calls.auth.map((call) => call[2].interactive),
+      [false, false, true, false, false],
+    );
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  it("does not retry a session-create 403 that is not the IP access list", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    network.verdict = "forbidden";
+    network.removeCookie();
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.deepEqual(shown(h), {
+      error: "Couldn't sign in to Databricks. Please try again.",
+      url: workspace,
+    });
+    await wait(60);
+    assert.equal(network.sessionCreates, 2);
+    assert.equal(h.calls.loadURL.length, 1);
+    assert.equal(network.browserSignIns, 0);
   });
 });
 
