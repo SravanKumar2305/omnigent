@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import io
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -123,19 +123,8 @@ def test_async_recorded_clip_matches_native_clip(tmp_path: Path) -> None:
 
     # The sync Playwright fixtures keep a loop running on the main thread, so
     # the async API gets its own loop in a worker thread.
-    failure: list[BaseException] = []
-
-    def worker() -> None:
-        try:
-            asyncio.run(drive())
-        except BaseException as exc:
-            failure.append(exc)
-
-    thread = threading.Thread(target=worker)
-    thread.start()
-    thread.join()
-    if failure:
-        raise failure[0]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(lambda: asyncio.run(drive())).result(timeout=120)
     _assert_same_pixels(shots["native"], shots["cropped"], scale=1)
 
 
@@ -175,7 +164,9 @@ def test_recorded_jpeg_clip_preserves_quality_and_path(
     # JPEG quantization tables expose the requested encoder quality, including zero.
     expected = io.BytesIO()
     Image.new("RGB", actual.size).save(expected, "JPEG", quality=quality)
-    assert actual.quantization == Image.open(expected).quantization
+    with Image.open(expected) as expected_image:
+        expected_quantization = expected_image.quantization
+    assert actual.quantization == expected_quantization
 
 
 @pytest.mark.parametrize("device_scale_factor", [1, 2])

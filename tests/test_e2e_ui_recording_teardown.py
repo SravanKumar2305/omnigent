@@ -65,14 +65,35 @@ def _configure(
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([root, os.environ.get("PYTHONPATH", "")]))
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     monkeypatch.delenv("OMNIGENT_E2E_RECORD_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_COMPAT_SERVER_VERSION", raising=False)
+    monkeypatch.delenv("OMNIGENT_COMPAT_SERVER_PYTHON", raising=False)
     if record_dir is not None:
         monkeypatch.setenv("OMNIGENT_E2E_RECORD_DIR", str(record_dir))
-    pytester.makeconftest('pytest_plugins = ["tests.e2e_ui.conftest"]')
+    pytester.makeconftest("""
+import pytest
+
+pytest_plugins = ["tests.e2e_ui.conftest"]
+
+@pytest.fixture(scope="session")
+def built_spa():
+    pytest.fail("recording regression must not build the SPA")
+
+@pytest.fixture(scope="session")
+def live_server():
+    pytest.fail("recording regression must not start a server")
+""")
 
 
+@pytest.mark.parametrize("inherited_compat", [False, True])
 def test_record_dir_stops_the_context_before_a_later_fixture_tears_down(
-    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    inherited_compat: bool,
 ) -> None:
+    if inherited_compat:
+        monkeypatch.setenv("OMNIGENT_COMPAT_SERVER_VERSION", "0.16.0")
+        monkeypatch.setenv("OMNIGENT_COMPAT_SERVER_PYTHON", "/unused/compat/python")
     _configure(pytester, monkeypatch, record_dir=tmp_path / "raw")
     pytester.makepyfile(_journey(closed_at_teardown=True))
 

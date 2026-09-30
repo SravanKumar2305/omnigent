@@ -143,6 +143,9 @@ filmed no matter how the test opened the browser. Playwright writes the `.webm` 
 random hash name) into that dir when the context closes. (If a test already
 hard-codes its own `record_video_dir` — some authored reproductions do — that
 explicit dir wins and the video lands there instead; check both locations.)
+For pytest-playwright fixtures, `--video` takes precedence over the environment
+variable: clips go to its output directory, and `--video retain-on-failure`
+discards passing-test videos.
 
 **The clip ends with the test body, not with fixture teardown.** Playwright
 writes the video when the recorded context closes, and pytest tears fixtures
