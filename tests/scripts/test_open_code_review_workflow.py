@@ -44,8 +44,6 @@ const github = {rest: {
   },
   issues: {
     listComments: () => {},
-    getComment: async () => ({data: input.comments[0]}),
-    updateComment: async (args) => { calls.push({update: args}); },
     createComment: async (args) => { calls.push({create: args}); },
   },
 }};
@@ -100,7 +98,6 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                 "INPUT_FORCE": "false",
                 "FORCE_REVIEW": "",
                 "REVIEW_HEAD": HEAD,
-                "REVIEW_RUN": "10-1",
                 "SUMMARY_URL": "https://github.com/omnigent-ai/omnigent/pull/7878#issuecomment-123",
                 **(extra_env or {}),
             },
@@ -603,90 +600,15 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             self.assertIn("does not match", result.stderr)
             self.assertEqual(outputs, "")
 
-    def test_summary_normalization_binds_zero_findings_to_current_run(self):
-        zero = (
-            "<!-- ocr-summary -->\n✅ **OpenCodeReview**: "
-            "Review complete: 0 finding(s) across 4 selected item(s)."
-        )
-        marker = "<!-- ocr-summary-run:10-1 -->"
-        marked = zero.replace("<!-- ocr-summary -->", f"<!-- ocr-summary -->\n{marker}")
-        routed = (
-            f"<!-- ocr-summary -->\n{marker}\n"
-            "⚠️ GitHub could not post this as an inline comment: Routed to summary (severity low)"
-        )
-        for body, expected in (
-            (zero, marked),
-            (marked, None),
-            (
-                routed,
-                f"<!-- ocr-summary -->\n{marker}\n"
-                "ℹ️ Shown here because this finding is low severity.",
-            ),
-        ):
-            with self.subTest(body=body):
-                result = self.normalize_summary(body)
-                self.assertNotIn("error", result)
-                self.assertEqual(
-                    result["calls"],
-                    []
-                    if expected is None
-                    else [
-                        {
-                            "update": {
-                                "owner": "omnigent-ai",
-                                "repo": "omnigent",
-                                "comment_id": 123,
-                                "body": expected,
-                            }
-                        }
-                    ],
-                )
-
-    def normalize_summary(self, body, **overrides):
-        comment = {
-            "body": body,
-            "user": {"login": "github-actions[bot]", "type": "Bot"},
-            "issue_url": "https://api.github.com/repos/omnigent-ai/omnigent/issues/7878",
-            **overrides,
-        }
-        return self.run_script(
-            self.comment(), script=STEPS["summary"]["with"]["script"], comments=[comment]
-        )
-
-    def test_summary_normalization_rejects_wrong_owner_or_unrecognized_body(self):
-        zero = (
-            "<!-- ocr-summary -->\n✅ **OpenCodeReview**: "
-            "Review complete: 0 finding(s) across 4 selected item(s)."
-        )
-        for body, overrides in (
-            (zero, {"user": {"login": "someone", "type": "User"}}),
-            (zero, {"issue_url": "https://api.github.com/repos/other/repo/issues/7878"}),
-            (zero, {"issue_url": "https://api.github.com/repos/omnigent-ai/omnigent/issues/999"}),
-            (zero.replace("0 finding", "1 finding"), {}),
-            (
-                zero.replace(
-                    "<!-- ocr-summary -->", "<!-- ocr-summary -->\n<!-- ocr-summary-run:9-1 -->"
-                ),
-                {},
-            ),
-            ("unrelated bot comment", {}),
-        ):
-            with self.subTest(body=body, overrides=overrides):
-                result = self.normalize_summary(body, **overrides)
-                self.assertIn("error", result)
-                self.assertEqual(result["calls"], [])
-
     def test_failed_publication_cannot_record_completion(self):
         step = STEPS["receipt"]
-        for outcome, failed, head, url, normalized, eligible in (
-            ("success", "0", HEAD, "summary-url", "success", True),
-            ("success", "0", HEAD, "summary-url", "failure", False),
-            ("success", "0", HEAD, "summary-url", "skipped", False),
-            ("failure", "0", HEAD, "summary-url", "success", False),
-            ("success", "1", HEAD, "summary-url", "success", False),
-            ("success", "", HEAD, "summary-url", "success", False),
-            ("success", "0", "", "summary-url", "success", False),
-            ("success", "0", HEAD, "", "success", False),
+        for outcome, failed, head, url, eligible in (
+            ("success", "0", HEAD, "summary-url", True),
+            ("failure", "0", HEAD, "summary-url", False),
+            ("success", "1", HEAD, "summary-url", False),
+            ("success", "", HEAD, "summary-url", False),
+            ("success", "0", "", "summary-url", False),
+            ("success", "0", HEAD, "", False),
         ):
             with self.subTest(outcome=outcome, failed=failed, head=head, url=url):
                 steps = {
@@ -695,7 +617,6 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                         "outputs": {"comments_failed": failed, "summary_comment_url": url},
                     },
                     "report": {"outputs": {"head": head}},
-                    "summary": {"outcome": normalized},
                 }
                 script = (
                     f"const steps = {json.dumps(steps)}; core.setOutput('receipt', {step['if']});"

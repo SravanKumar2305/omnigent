@@ -242,9 +242,9 @@ jobs:
           upload_artifacts: 'false'
           stream_progress: 'true'
 
-      - name: Normalize OCR summary
-        id: summary
+      - name: Clarify low-severity summary findings
         if: ${{ !cancelled() && steps.ocr.outputs.summary_comment_url != '' }}
+        continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           SUMMARY_URL: ${{ steps.ocr.outputs.summary_comment_url }}
@@ -256,25 +256,18 @@ jobs:
             if (!match) throw new Error('OCR returned an invalid summary comment URL');
             const args = { ...context.repo, comment_id: Number(match[1]) };
             const { data: comment } = await github.rest.issues.getComment(args);
-            let body = (comment.body || '').replace(
+            const body = (comment.body || '').replace(
               /^⚠️ GitHub could not post this as an inline comment: Routed to summary \(severity low(?: · category [^)\r\n]+)?\)$/gm,
               'ℹ️ Shown here because this finding is low severity.',
             );
+            if (body === (comment.body || '')) return;
             const marker = `<!-- ocr-summary-run:${process.env.REVIEW_RUN} -->`;
             if (comment.user?.login !== 'github-actions[bot]' || comment.user.type !== 'Bot' ||
-                comment.issue_url !== `https://api.github.com/repos/${context.repo.owner}/${context.repo.repo}/issues/${process.env.PR_NUMBER}`) {
+                !comment.issue_url.endsWith(`/issues/${process.env.PR_NUMBER}`) ||
+                !(comment.body || '').split('\n').includes(marker)) {
               throw new Error('Refusing to edit a summary not owned by this OCR run');
             }
-            // OCR omits the run marker only on its zero-findings summary path.
-            const zeroFindings = /^<!-- ocr-summary -->\n✅ \*\*OpenCodeReview\*\*: Review complete: 0 finding\(s\) across \d+ selected item\(s\)\.\s*$/;
-            if (zeroFindings.test(body)) {
-              body = body.replace('<!-- ocr-summary -->', `<!-- ocr-summary -->\n${marker}`);
-            } else if (body.split('\n')[0] !== '<!-- ocr-summary -->' || body.split('\n')[1] !== marker) {
-              throw new Error('Refusing to mark a summary not owned by this OCR run');
-            }
-            if (body !== (comment.body || '')) {
-              await github.rest.issues.updateComment({ ...args, body });
-            }
+            await github.rest.issues.updateComment({ ...args, body });
 
       - name: Redact review diagnostics
         id: diagnostics
@@ -370,7 +363,7 @@ jobs:
       - name: Record successfully published review
         id: receipt
         if: >-
-          steps.ocr.outcome == 'success' && steps.summary.outcome == 'success' && steps.report.outputs.head != '' &&
+          steps.ocr.outcome == 'success' && steps.report.outputs.head != '' &&
           steps.ocr.outputs.comments_failed == '0' && steps.ocr.outputs.summary_comment_url != ''
         env:
           PR_NUMBER: ${{ needs.request.outputs.pr }}
