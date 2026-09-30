@@ -50,6 +50,8 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostMcpServersFrame,
+    HostMcpServersResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRunnerExitedFrame,
@@ -289,6 +291,46 @@ async def test_host_skills_does_not_block_tunnel(
     assert decode_host_frame(ws.sent[-1]) == HostSkillsResultFrame(
         request_id="skills", status="ok"
     )
+
+
+async def test_host_answers_mcp_inventory_over_the_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    (home / ".cursor").mkdir(parents=True)
+    (home / ".cursor" / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"slack": {"command": "slack", "env": {"T": "secret"}}}})
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    host = _make_host_process()
+    ws = _RecordingWS()
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed WebSocket
+        encode_host_frame(HostMcpServersFrame(request_id="mcp")),
+    )
+    await _drain_frame_tasks(host)
+    assert decode_host_frame(ws.sent[-1]) == HostMcpServersResultFrame(
+        request_id="mcp",
+        status="ok",
+        mcp_servers=[
+            {"name": "slack", "harness": "cursor", "transport": "stdio", "scope": "user"}
+        ],
+    )
+    assert "secret" not in ws.sent[-1]
+
+
+async def test_host_reports_mcp_inventory_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    host = _make_host_process()
+
+    def fail() -> list[dict[str, str]]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(host._mcp_inventory, "discover", fail)
+    result = host._handle_mcp_servers(HostMcpServersFrame(request_id="r"))
+    assert (result.status, result.mcp_servers) == ("failed", [])
+    assert result.error is not None and "boom" not in result.error
 
 
 async def test_handle_model_options_serves_the_claude_catalog(
