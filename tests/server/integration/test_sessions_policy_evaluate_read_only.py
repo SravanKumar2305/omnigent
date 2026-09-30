@@ -109,9 +109,6 @@ def _request_request(text: str = "do the thing") -> dict[str, Any]:
     }
 
 
-# ── Fixtures ─────────────────────────────────────────────────────
-
-
 async def _create_session_as(
     client: httpx.AsyncClient,
     user: str,
