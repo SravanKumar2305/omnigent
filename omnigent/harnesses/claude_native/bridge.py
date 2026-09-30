@@ -3969,7 +3969,7 @@ _prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
 def _delivery_event(event: str, *, level: int = logging.INFO, **attributes: object) -> None:
     """Emit content-free diagnostics to both the local log and structured sink."""
     trace = _prompt_delivery_trace.get()
-    if trace is None:
+    if trace is None or not _logger.isEnabledFor(level):
         return
     fields = {
         "delivery_id": trace.delivery_id,
@@ -4227,11 +4227,12 @@ def _paste_and_submit(
     if trace is not None:
         trace.attempt += 1
         trace.verification = "not_started"
-    _delivery_stage("pasting")
+    _delivery_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    _delivery_stage("pasting")
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -4303,11 +4304,12 @@ def _paste_and_submit(
         **_draft_observation(pane, needle),
     )
     time.sleep(_PASTE_SETTLE_S)
-    _delivery_stage("submitting")
+    _delivery_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    _delivery_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     _delivery_event("claude_native_submit_sent", draft_seen=draft_seen)
     if not draft_seen:
@@ -4339,6 +4341,28 @@ def _paste_and_submit(
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
+    )
+
+
+def _report_submit_verification(
+    verification: str,
+    *,
+    start: float,
+    retries: int,
+    polls: int,
+    observation: _DraftObservation,
+) -> None:
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        trace.verification = verification
+    _delivery_event(
+        "claude_native_submit_verification",
+        level=logging.INFO if verification == "draft_absent" else logging.WARNING,
+        verification=verification,
+        wait_ms=round((time.monotonic() - start) * 1000),
+        retries=retries,
+        polls=polls,
+        **observation,
     )
 
 
@@ -4389,17 +4413,12 @@ def _verify_submit_accepted(
                 if observation["capture_empty"] or not observation["prompt_glyph_visible"]
                 else "draft_absent"
             )
-            trace = _prompt_delivery_trace.get()
-            if trace is not None:
-                trace.verification = verification
-            _delivery_event(
-                "claude_native_submit_verification",
-                level=logging.WARNING if verification == "inconclusive_capture" else logging.INFO,
-                verification=verification,
-                wait_ms=round((time.monotonic() - start) * 1000),
+            _report_submit_verification(
+                verification,
+                start=start,
                 retries=retries,
                 polls=polls,
-                **observation,
+                observation=observation,
             )
             if warned:
                 _logger.info(
@@ -4424,17 +4443,12 @@ def _verify_submit_accepted(
             retries += 1
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
-    trace = _prompt_delivery_trace.get()
-    if trace is not None:
-        trace.verification = "draft_still_present"
-    _delivery_event(
-        "claude_native_submit_verification",
-        level=logging.WARNING,
-        verification="draft_still_present",
-        wait_ms=round((time.monotonic() - start) * 1000),
+    _report_submit_verification(
+        "draft_still_present",
+        start=start,
         retries=retries,
         polls=polls,
-        **_draft_observation(pane, needle),
+        observation=_draft_observation(pane, needle),
     )
     return False
 

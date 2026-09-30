@@ -13,7 +13,7 @@ their local harness/runner logs; this instrumentation does not enable log shippi
 | Event | Meaning |
 | --- | --- |
 | `claude_native_delivery_started` | One web/SDK message entered the bridge. Records byte/newline counts and whether its first line is blank, without prompt text. |
-| `claude_native_delivery_stage` | Entered a stage: waiting for tmux, restoring input, waiting for the prompt, pasting, waiting for the draft, submitting, or verifying. |
+| `claude_native_delivery_stage` | Entered a stage: waiting for tmux, restoring input, waiting for the prompt, checking for a pending question, pasting, waiting for the draft, submitting, or verifying. |
 | `claude_native_draft_observed` | Draft polling ended. Records `draft_seen`, wait duration, poll/empty-capture counts, and a content-free summary of the final capture. |
 | `claude_native_submit_sent` | The initial tmux Enter command returned successfully. This is not an acceptance acknowledgment. |
 | `claude_native_submit_unverified` | **Warning:** the draft was never observed, so Enter was sent without submission verification. |

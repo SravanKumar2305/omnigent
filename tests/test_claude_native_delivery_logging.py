@@ -24,6 +24,8 @@ from omnigent.harnesses.claude_native import bridge
         ("missing_glyph", "inconclusive_capture", "returned"),
         ("transport_error", "not_started", "error"),
         ("startup_error", "not_started", "error"),
+        ("pending_before_paste", "not_started", "error"),
+        ("pending_before_submit", "not_started", "error"),
         ("cancelled", "not_started", "interrupted"),
     ],
 )
@@ -42,6 +44,12 @@ def test_delivery_diagnostics(
     elapsed = 0.0
     pane = "❯ "
     enters = 0
+    pending_checks = 0
+
+    def pending_prompt(*args: object) -> bool:
+        nonlocal pending_checks
+        pending_checks += 1
+        return pending_checks == (1 if scenario == "pending_before_paste" else 2)
 
     def sleep(seconds: float) -> None:
         nonlocal elapsed
@@ -65,7 +73,11 @@ def test_delivery_diagnostics(
                 return
             pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
 
-    monkeypatch.setattr(bridge, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep))
+    monkeypatch.setattr(
+        bridge,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep, time=lambda: elapsed),
+    )
     monkeypatch.setattr(
         bridge,
         "_wait_for_tmux_info",
@@ -75,6 +87,8 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    if scenario.startswith("pending_"):
+        monkeypatch.setattr(bridge, "has_pending_user_prompt", pending_prompt)
     if scenario == "unknown_command":
         monkeypatch.setattr(bridge, "_unknown_command_rejection_appeared", lambda *_a, **_k: True)
     monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.03)
@@ -90,7 +104,10 @@ def test_delivery_diagnostics(
         if outcome == "returned":
             bridge.inject_user_message(tmp_path, content=content)
         else:
-            with pytest.raises(RuntimeError):
+            expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
+            if scenario.startswith("pending_"):
+                expected = bridge.ClaudeUserPromptPending
+            with pytest.raises(expected):
                 bridge.inject_user_message(tmp_path, content=content)
 
     records = [
@@ -132,3 +149,6 @@ def test_delivery_diagnostics(
         assert records[-1].attributes["stage"] == "waiting_for_prompt"
     elif scenario == "transport_error":
         assert records[-1].attributes["stage"] == "pasting"
+    elif scenario.startswith("pending_"):
+        assert records[-1].attributes["stage"] == "checking_pending_prompt"
+        assert enters == 0
