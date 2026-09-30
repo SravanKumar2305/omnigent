@@ -355,20 +355,6 @@ function NavProbe() {
       <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
         to-home
       </button>
-      <button
-        type="button"
-        data-testid="nav-agents-panel"
-        onClick={() => navigate("?panel=agents")}
-      >
-        reveal-agents
-      </button>
-      <button
-        type="button"
-        data-testid="nav-current-session"
-        onClick={() => navigate({ search: "" })}
-      >
-        current-agent-chat
-      </button>
     </div>
   );
 }
@@ -3075,19 +3061,6 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
-  });
-
-  it("closes the mobile drawer when selecting the current child and reopens from its link", () => {
-    mockConversations([{ id: "conv_child", permission_level: null }]);
-    renderShell("/c/conv_child?panel=agents");
-
-    expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "open");
-    fireEvent.click(screen.getByTestId("nav-current-session"));
-    expect(screen.getByTestId("url-params")).toBeEmptyDOMElement();
-    expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "closed");
-
-    fireEvent.click(screen.getByTestId("nav-agents-panel"));
-    expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "open");
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {

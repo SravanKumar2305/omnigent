@@ -322,6 +322,11 @@ async def test_create_titled_session_keeps_title_after_first_message(
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["title"] == "canvas-layout"
 
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    message = next(item for item in items if item.get("role") == "user")
+    assert message["user_authored"] is True
+    assert not message.get("is_meta")
+
 
 async def test_sidebar_rename_wins_in_flight_background_title(
     client: httpx.AsyncClient,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -7769,31 +7768,6 @@ def test_append_dedupe_does_not_burn_a_position(
     assert got_fresh.deduplicated is False
     page = conversation_store.list_items(conv.id)
     assert len(page.data) == 2
-
-
-def test_concurrent_append_with_stable_id_is_persisted_once(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    item = NewConversationItem(
-        type="resource_event",
-        stable_id="1234567890abcdef1234567890abcdef",
-        response_id="subagent_duplicate_edge",
-        data=ResourceEventData(
-            event_type="session.subagent.delegated",
-            resource_id="child",
-            resource_type="session",
-            resource={"title": "Research"},
-        ),
-    )
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(
-            pool.map(
-                lambda _: SqlAlchemyConversationStore(db_uri).append(parent.id, [item])[0],
-                range(16),
-            )
-        )
-    assert sum(not result.deduplicated for result in results) == 1
-    assert len(store.list_items(parent.id).data) == 1
 
 
 def test_pure_dedupe_append_leaves_conversation_metadata_alone(

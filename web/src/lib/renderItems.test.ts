@@ -68,13 +68,7 @@ describe("sub-agent timeline events", () => {
     ctx: ctx({ itemId: "notice_1", responseId: "subagent_returned" }),
     toolType: "subagent_activity",
     label: "Sub-agent activity",
-    data: {
-      type: "resource_event",
-      event_type: "session.subagent.returned",
-      resource_type: "session",
-      resource_id: "child_1",
-      resource: { title: "Review" },
-    },
+    data: {},
   });
   const work: AnyBlock = {
     type: "tool_group",
@@ -103,42 +97,31 @@ describe("sub-agent timeline events", () => {
     expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
   });
 
-  it("keeps a steered parent response expanded across a subagent notice", () => {
+  it.each([false, true])("preserves timeline and parent identity with steering = %s", (steered) => {
     const user: AnyBlock = {
       type: "user_message",
       ctx: ctx({ itemId: "steering", responseId: "parent_turn" }),
       content: [{ type: "input_text", text: "Include the API change too." }],
     };
-    const bubbles = buildBubbles([work, notice(), user, answer], null);
-
+    const cache = createBubbleCache();
+    const blocks = [work, notice(), ...(steered ? [user] : [])];
+    buildBubbles(blocks, null, cache);
+    const bubbles = buildBubbles([...blocks, answer], null, cache);
     expect(bubbles.map((bubble) => bubble.kind)).toEqual([
       "assistant",
       "subagent_activity",
-      "user",
+      ...(steered ? ["user"] : []),
       "assistant",
     ]);
-    expect(bubbles[3]).toMatchObject({
+    if (!steered) expect(bubbles[0]).toMatchObject({ continued: true });
+    expect(bubbles.at(-1)).toMatchObject({
       responseId: "parent_turn",
-      defaultExpanded: true,
+      stableId: "parent_answer",
+      ...(steered ? { defaultExpanded: true } : {}),
       items: [{ kind: "text", text: "The review is complete." }],
     });
-  });
-
-  it("keeps timeline order and folds earlier work across a real assistant continuation", () => {
-    const cache = createBubbleCache();
-    const event = notice();
-    buildBubbles([work, event], null, cache);
-    const bubbles = buildBubbles([work, event, answer], null, cache);
-    expect(bubbles.map((bubble) => bubble.kind)).toEqual([
-      "assistant",
-      "subagent_activity",
-      "assistant",
-    ]);
-    expect(bubbles[0]).toMatchObject({ responseId: "parent_turn", continued: true });
-    expect(bubbles[1]).toMatchObject({ itemId: "notice_1" });
-    expect(bubbles[2]).toMatchObject({ responseId: "parent_turn", stableId: "parent_answer" });
-    expect(lastRenderableAssistantIndex(bubbles)).toBe(2);
-    expect(liveCandidateAssistantIndex(bubbles)).toBe(2);
+    expect(lastRenderableAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(bubbles.length - 1);
   });
 });
 

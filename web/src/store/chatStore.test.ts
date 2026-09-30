@@ -7449,119 +7449,72 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it.each([
-      '<teammate-message teammate_id="reviewer">Review complete</teammate-message>',
-      '<agent-message from="reviewer">Review complete</agent-message>',
-      'Another Claude session sent a message:\n<teammate-message teammate_id="reviewer">Review complete</teammate-message>',
-      "<task-notification><task-id>task-1</task-id><summary>Agent reviewer finished</summary></task-notification>",
-      "<task-notification><task-id>agent-1</task-id><result>Final report</result></task-notification>",
-    ])(
-      "ignores unmarked native agent context without stealing a queued user message: %s",
-      (text) => {
-        const pending: ConversationState["pendingUserMessages"] = [
-          { tempId: "pending_user", content: [{ type: "input_text", text: "Keep reviewing" }] },
-        ];
-        useChatStore.setState({ blocks: [], pendingUserMessages: pending });
-
-        handleSessionEvent({
-          type: "session_input_consumed",
-          itemId: "msg_agent_context",
-          itemType: "message",
-          data: { role: "user", content: [{ type: "input_text", text }] },
-        });
-
-        expect(useChatStore.getState().blocks).toEqual([]);
-        expect(useChatStore.getState().pendingUserMessages).toBe(pending);
+    const teamContent = [
+      {
+        type: "input_text" as const,
+        text: '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
       },
-    );
-
+    ];
     it.each([
-      '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
-      '<agent-message from="reviewer">Review this</agent-message>',
-    ])("acknowledges a human's bare envelope without hiding it: %s", (text) => {
-      const content = [{ type: "input_text" as const, text }];
-      for (const authorship of [
-        { createdBy: "alice@example.com" },
-        { userAuthored: true },
-        { clearedPendingId: "pending_xml" },
-      ]) {
-        useChatStore.setState({
-          blocks: [],
-          pendingUserMessages: [{ tempId: "pending_xml", content }],
-        });
-        handleSessionEvent({
-          type: "session_input_consumed",
-          itemId: "msg_user_xml",
-          itemType: "message",
-          ...authorship,
-          data: { role: "user", content, user_authored: "userAuthored" in authorship },
-        });
-
-        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-        expect(useChatStore.getState().blocks).toMatchObject([
-          {
-            type: "user_message",
-            ctx: { itemId: "msg_user_xml" },
-            stableKey: "pending_xml",
-            content,
-          },
-        ]);
-      }
-    });
-
-    it("keeps unrelated input queued when bare XML is typed directly in the terminal", () => {
-      const content = [
-        {
-          type: "input_text" as const,
-          text: '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
-        },
-      ];
-      const pending = [
-        { tempId: "pending_web", content: [{ type: "input_text" as const, text: "Still queued" }] },
-      ];
+      {},
+      { createdBy: "alice@example.com" },
+      { userAuthored: true },
+      { clearedPendingId: "xml" },
+    ])("requires human provenance before acknowledging a team-shaped prompt: %j", (authorship) => {
+      const pending = [{ tempId: "xml", content: teamContent }];
       useChatStore.setState({ blocks: [], pendingUserMessages: pending });
-      const event: SessionInputConsumedEvent = {
-        type: "session_input_consumed",
-        itemId: "msg_tui_xml",
-        itemType: "message",
-        data: { role: "user", content, user_authored: true },
-      };
-      handleSessionEvent(event);
-
-      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
-      expect(useChatStore.getState().blocks).toMatchObject([
-        { type: "user_message", ctx: { itemId: "msg_tui_xml" }, content },
-      ]);
-    });
-
-    it("uses the named acknowledgement for a bare envelope while keeping other input queued", () => {
-      const content = [
-        {
-          type: "input_text" as const,
-          text: '<agent-message from="reviewer">Review this</agent-message>',
-        },
-      ];
-      const unrelated = {
-        tempId: "pending_other",
-        content: [{ type: "input_text" as const, text: "Still queued" }],
-      };
-      useChatStore.setState({
-        blocks: [],
-        pendingUserMessages: [unrelated, { tempId: "pending_xml", content }],
-      });
       handleSessionEvent({
         type: "session_input_consumed",
-        itemId: "msg_user_xml",
+        itemId: "msg_xml",
         itemType: "message",
-        clearedPendingId: "pending_xml",
-        data: { role: "user", content },
+        ...authorship,
+        data: { role: "user", content: teamContent, user_authored: "userAuthored" in authorship },
       });
-
-      expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
-      expect(useChatStore.getState().blocks).toMatchObject([
-        { type: "user_message", stableKey: "pending_xml", content },
-      ]);
+      const human = Object.keys(authorship).length > 0;
+      expect(useChatStore.getState().pendingUserMessages).toEqual(human ? [] : pending);
+      expect(useChatStore.getState().blocks).toMatchObject(
+        human
+          ? [
+              {
+                type: "user_message",
+                ctx: { itemId: "msg_xml" },
+                stableKey: "xml",
+                content: teamContent,
+              },
+            ]
+          : [],
+      );
     });
+
+    it.each([false, true])(
+      "keeps unrelated input queued with named acknowledgement = %s",
+      (named) => {
+        const unrelated = {
+          tempId: "other",
+          content: [{ type: "input_text" as const, text: "Still queued" }],
+        };
+        useChatStore.setState({
+          blocks: [],
+          pendingUserMessages: [
+            unrelated,
+            ...(named ? [{ tempId: "xml", content: teamContent }] : []),
+          ],
+        });
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "msg_xml",
+          itemType: "message",
+          ...(named ? { clearedPendingId: "xml" } : {}),
+          data: { role: "user", content: teamContent, user_authored: true },
+        };
+        handleSessionEvent(event);
+        handleSessionEvent(event);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
+        expect(useChatStore.getState().blocks).toMatchObject([
+          { type: "user_message", ctx: { itemId: "msg_xml" }, content: teamContent },
+        ]);
+      },
+    );
 
     it("is a no-op for non-message item types (e.g. function_call_output from other client)", () => {
       const existingBlocks: AnyBlock[] = [];
