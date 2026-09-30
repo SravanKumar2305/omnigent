@@ -950,10 +950,11 @@ export function AppShell() {
         const text = buildDesignModePrompt(payload.element, payload.prompt);
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
-        void useChatStore
-          .getState()
+        const chat = useChatStore.getState();
+        const queued = chat.piCompactPending;
+        void chat
           .send(text, boundAgentId, file ? [file] : undefined)
-          .then(() => signal(true, "Sent to agent."))
+          .then(() => signal(true, queued ? "Queued." : "Sent to agent."))
           .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
         // Clear the stashed screenshot so a later submit without a fresh pick
         // doesn't reuse a stale crop.

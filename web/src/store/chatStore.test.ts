@@ -14203,14 +14203,30 @@ describe("chatStore — policy deny renders once", () => {
 
 describe("chatStore — client-side message queue", () => {
   it.each([
-    ...["codex-native", "claude-sdk"].flatMap((harness) =>
+    ...["codex-native", "claude-sdk", "pi-native"].flatMap((harness) =>
       ["foreground", "background", "evicted", "stranded"].map((mode) => [harness, mode]),
     ),
     ["claude-sdk", "steered"],
+    ["pi-native", "steered"],
+    ["pi-native", "failed"],
+    ["pi-native", "legacy-failed"],
+    ["pi-native", "lost-foreground"],
+    ["pi-native", "lost-unlisted"],
+    ["pi-native", "lost-completion"],
+    ["pi-native", "lost-empty"],
+    ["pi-native", "lost-steer"],
+    ["pi-native", "lost-bulk"],
   ])(
     "queues %s compact as a control and holds the next message until idle (%s)",
     async (harness, mode) => {
-      const background = mode !== "foreground" && mode !== "steered";
+      const background = ![
+        "foreground",
+        "steered",
+        "failed",
+        "legacy-failed",
+        "lost-foreground",
+        "lost-unlisted",
+      ].includes(mode);
       const id = "conv_compact";
       seedSession(id, []);
       fetchMock.mockImplementation(async (input, init) => {
@@ -14298,24 +14314,113 @@ describe("chatStore — client-side message queue", () => {
       await tick();
       expect(posts()).toHaveLength(1);
       expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["after compact"]);
-      handleSessionEvent(
-        {
-          type: "session_status",
-          conversationId: id,
-          status: "running",
-          responseId: "compact_turn",
-        },
-        id,
-      );
-      handleSessionEvent(
-        {
-          type: "session_status",
-          conversationId: id,
-          status: "idle",
-          responseId: "compact_turn",
-        },
-        id,
-      );
+      if (harness === "pi-native") {
+        // Aborting a steered turn must not release messages during compaction.
+        handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" }, id);
+        flush();
+        expect(posts()).toHaveLength(1);
+        expect(conversationRegistry.peek(id)!.getState().piCompactPending).toBe(true);
+        useChatStore.getState().steerMessage(queued[1]!.queueId);
+        expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+        expect(toastError).toHaveBeenCalledWith("Wait for Pi compaction to finish before sending", {
+          richColors: true,
+        });
+        expect(posts()).toHaveLength(1);
+        if (background) {
+          expect(conversationRegistry.evictLruEvictable("conv_other")).not.toBe(id);
+        }
+        if (mode.startsWith("lost-")) {
+          if (mode === "lost-foreground") seedConversationsCache([conv(id, "idle")]);
+          if (mode === "lost-unlisted") seedConversationsCache([]);
+          if (mode === "lost-empty") useChatStore.getState().clearQueuedMessages(id);
+          conversationRegistry.peek(id)!.setState({ sendLatchedAt: Date.now() - 10 * 60_000 });
+          if (mode === "lost-steer" || mode === "lost-bulk") {
+            useChatStore.setState((s) => ({
+              queuedMessages: [
+                ...s.queuedMessages,
+                {
+                  queueId: "compact-again",
+                  text: "/compact",
+                  command: "compact",
+                  conversationId: id,
+                },
+                { queueId: "tail", text: "later", conversationId: id },
+              ],
+            }));
+            toastError.mockClear();
+            if (mode === "lost-bulk") useChatStore.getState().steerAllQueuedMessages(id);
+            else useChatStore.getState().steerMessage(queued[1]!.queueId);
+            expect(toastError).not.toHaveBeenCalled();
+            expect(useChatStore.getState().queuedMessages).toEqual([
+              expect.objectContaining({ queueId: "compact-again", requiresRetry: true }),
+              expect.objectContaining({ queueId: "tail", requiresRetry: true }),
+            ]);
+            useChatStore.getState().clearQueuedMessages(id);
+          } else {
+            if (mode === "lost-foreground") {
+              seedConversationsCache([conv(id, "running")]);
+              flush();
+              expect(conversationRegistry.peek(id)!.getState().piCompactPending).toBe(true);
+              seedConversationsCache([conv(id, "idle")]);
+            }
+            flush();
+            flush();
+            expect(posts()).toHaveLength(1);
+            if (mode === "lost-empty") {
+              expect(conversationRegistry.peek(id)!.getState().piCompactPending).toBe(false);
+              expect(conversationRegistry.evictLruEvictable("conv_other")).toBe(id);
+              return;
+            }
+            expect(conversationRegistry.peek(id)!.getState().piCompactPending).toBe(false);
+            handleSessionEvent({ type: "compaction_completed", totalTokens: null }, id);
+            flush();
+            expect(posts()).toHaveLength(1);
+            expect(useChatStore.getState().queuedMessages[0]!.requiresRetry).toBe(true);
+          }
+          expect(conversationRegistry.peek(id)!.getState().blocks).toContainEqual(
+            expect.objectContaining({
+              type: "error",
+              message: expect.stringContaining("Check the terminal"),
+            }),
+          );
+          if (mode !== "lost-steer" && mode !== "lost-bulk")
+            useChatStore.getState().steerMessage(queued[1]!.queueId);
+        } else {
+          handleSessionEvent(
+            mode === "legacy-failed"
+              ? {
+                  type: "error",
+                  source: "execution",
+                  toolName: null,
+                  error: { code: "pi_compact_unavailable", message: "Unavailable" },
+                }
+              : mode === "failed"
+                ? { type: "compaction_failed" }
+                : { type: "compaction_completed", totalTokens: null },
+            id,
+          );
+        }
+        expect(conversationRegistry.peek(id)!.getState().piCompactPending).toBe(false);
+      } else {
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "running",
+            responseId: "compact_turn",
+          },
+          id,
+        );
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "idle",
+            responseId: "compact_turn",
+          },
+          id,
+        );
+      }
       flush();
       await tick();
       expect(posts().map((p) => p.type)).toEqual(["compact", "message"]);
@@ -14324,38 +14429,125 @@ describe("chatStore — client-side message queue", () => {
     },
   );
 
-  it("keeps a failed compact queued for retry", async () => {
-    seedSession("conv_compact", []);
-    await useChatStore.getState().switchTo("conv_compact");
-    useChatStore.setState({
-      sessionHarness: "codex-native",
-      status: "streaming",
-      sessionStatus: "running",
-    });
-    useChatStore.getState().enqueueMessage("/compact");
-    fetchMock.mockImplementation(async (url, init) => {
-      if (String(url).endsWith("/events")) throw new Error("Host disconnected");
-      return defaultFetchHandler(url as RequestInfo, init as RequestInit);
-    });
-    handleSessionEvent({ type: "session_status", conversationId: "conv_compact", status: "idle" });
-    useChatStore.getState().maybeFlushQueuedHead();
-    await tick();
-    expect(useChatStore.getState().queuedMessages).toEqual([
-      expect.objectContaining({ command: "compact", text: "/compact", requiresRetry: true }),
-    ]);
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    expect(useChatStore.getState().status).toBe("idle");
-    fetchMock.mockImplementation(defaultFetchHandler);
-    useChatStore.getState().steerMessage(useChatStore.getState().queuedMessages[0]!.queueId);
-    await tick();
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/v1/sessions/conv_compact/events",
-      expect.objectContaining({
-        body: JSON.stringify({ type: "compact", data: {} }),
-      }),
-    );
-    expect(useChatStore.getState().queuedMessages).toEqual([]);
-  });
+  it.each([
+    ["codex-native", false],
+    ["pi-native", false],
+    ["pi-native", true],
+  ] as const)(
+    "keeps a failed %s compact queued for retry (steered: %s)",
+    async (harness, steered) => {
+      seedSession("conv_compact", []);
+      await useChatStore.getState().switchTo("conv_compact");
+      useChatStore.setState({
+        sessionHarness: harness,
+        status: "streaming",
+        sessionStatus: "running",
+        sendLatchedAt: 1234,
+      });
+      useChatStore.getState().enqueueMessage("/compact");
+      fetchMock.mockImplementation(async (url, init) => {
+        if (String(url).endsWith("/events")) throw new Error("Host disconnected");
+        return defaultFetchHandler(url as RequestInfo, init as RequestInit);
+      });
+      if (steered) {
+        useChatStore.getState().steerMessage(useChatStore.getState().queuedMessages[0]!.queueId);
+      } else {
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_compact",
+          status: "idle",
+        });
+        useChatStore.getState().maybeFlushQueuedHead();
+      }
+      await tick();
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({ command: "compact", text: "/compact", requiresRetry: true }),
+      ]);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().status).toBe(steered ? "streaming" : "idle");
+      if (steered) expect(useChatStore.getState().sendLatchedAt).toBe(1234);
+      expect(useChatStore.getState().piCompactPending).toBe(false);
+      fetchMock.mockImplementation(defaultFetchHandler);
+      useChatStore.getState().steerMessage(useChatStore.getState().queuedMessages[0]!.queueId);
+      await tick();
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/sessions/conv_compact/events",
+        expect.objectContaining({
+          body: JSON.stringify({ type: "compact", data: {} }),
+        }),
+      );
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+    },
+  );
+
+  it.each([false, true])(
+    "retains direct Pi sends during compact (background: %s)",
+    async (background) => {
+      const id = "conv_direct_compact";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+      useChatStore.setState({ sessionHarness: "pi-native", piCompactPending: true });
+      if (background) {
+        seedSession("conv_other", []);
+        await useChatStore.getState().switchTo("conv_other");
+        seedConversationsCache([conv(id, "idle"), conv("conv_other", "idle")]);
+      }
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/resources/files")) {
+          return mockResponse({
+            id: "file_shot",
+            name: "shot.png",
+            metadata: { filename: "shot.png", bytes: 10, created_at: 0 },
+          });
+        }
+        return defaultFetchHandler(input as RequestInfo, init as RequestInit);
+      });
+      const files = [new File(["screenshot"], "shot.png", { type: "image/png" })];
+      const replyDraft: StoredReplyDraft = {
+        version: 1,
+        quotes: [{ before: "", text: "Review this" }],
+        text: "Fix it",
+      };
+      const posts = () =>
+        fetchMock.mock.calls.filter(
+          ([url, init]) => url === `/v1/sessions/${id}/events` && init?.method === "POST",
+        );
+      await useChatStore.getState().send("Fix it", "agent_xyz", files, {
+        pinnedConversationId: id,
+        stableId: "direct-stable",
+        replyDraft,
+      });
+      expect(posts()).toHaveLength(0);
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({
+          text: "Fix it",
+          files,
+          replyDraft,
+          stableId: "direct-stable",
+          conversationId: id,
+        }),
+      ]);
+      handleSessionEvent({ type: "compaction_completed", totalTokens: null }, id);
+      const flush = () =>
+        background
+          ? useChatStore.getState().flushBackgroundQueues()
+          : useChatStore.getState().maybeFlushQueuedHead();
+      flush();
+      await tick();
+      flush();
+      await tick();
+      expect(posts()).toHaveLength(1);
+      const body = JSON.parse(posts()[0]![1]!.body as string);
+      expect(body.data.stable_id).toBe("direct-stable");
+      expect(body.data.content).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "input_image" }),
+          { type: "input_text", text: "Fix it" },
+        ]),
+      );
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+    },
+  );
 
   it.each([false, true])("bulk steers SDK compact while busy (has prefix: %s)", async (prefix) => {
     const id = "conv_sdk_compact";
