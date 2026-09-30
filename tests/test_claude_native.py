@@ -8967,7 +8967,7 @@ def test_transcript_records_drop_adjacent_store_duplicates(bare_duplicates: bool
         duplicate = {
             k: v for k, v in items[0].items() if k not in ("id", "created_at", "response_id")
         }
-        items = [duplicate] * 3 + [items[-1]]
+        items = [dict(duplicate) for _ in range(3)] + [items[-1]]
     else:
         items.insert(2, {**items[1], "id": "msg_retry", "created_at": 108})
     records = claude_native._claude_transcript_records_from_session_items(
