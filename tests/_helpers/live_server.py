@@ -58,14 +58,6 @@ from tests._helpers.compat import apply_server_env, compat_server_cwd, server_ex
 
 # Project root — this file lives at tests/_helpers/live_server.py.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_LOCAL_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 
 def find_free_port() -> int:
@@ -81,9 +73,15 @@ def find_free_port() -> int:
 
 def local_server_env(extra: dict[str, str]) -> dict[str, str]:
     """Use this checkout and local header auth, stripping ambient proxy/auth settings."""
+    pythonpath = [
+        str(_REPO_ROOT),
+        str(_REPO_ROOT / "sdks" / "python-client"),
+        str(_REPO_ROOT / "sdks" / "ui"),
+        *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep)),
+    ]
     env = {
         **os.environ,
-        "PYTHONPATH": _LOCAL_PYTHONPATH,
+        "PYTHONPATH": os.pathsep.join(pythonpath),
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
         "OMNIGENT_AUTH_PROVIDER": "header",
@@ -135,7 +133,8 @@ def isolated_local_server(
     """
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    with (tmp_path / "server.log").open("w") as log:
+    log_path = tmp_path / "server.log"
+    with log_path.open("w") as log:
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -160,6 +159,10 @@ def isolated_local_server(
             last = "not polled"
             with httpx.Client(trust_env=False) as client:
                 while time.monotonic() < deadline:
+                    assert proc.poll() is None, (
+                        f"Server exited with code {proc.returncode} before becoming healthy.\n"
+                        f"Server log tail:\n{log_path.read_text(errors='replace')[-4000:]}"
+                    )
                     try:
                         if client.get(f"{base_url}/health", timeout=2.0).status_code == 200:
                             break
@@ -168,7 +171,10 @@ def isolated_local_server(
                         last = f"{type(exc).__name__}: {exc}"
                     time.sleep(poll_interval)
                 else:
-                    raise AssertionError(f"{base_url}/health never became healthy: {last}")
+                    raise AssertionError(
+                        f"{base_url}/health never became healthy: {last}\n"
+                        f"Server log tail:\n{log_path.read_text(errors='replace')[-4000:]}"
+                    )
             yield base_url
         finally:
             terminate_process(proc)
