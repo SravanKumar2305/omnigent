@@ -1,8 +1,8 @@
+import { renderSidebar as renderSidebarAt } from "./sidebarTestHelpers";
 import { conversationPage } from "./sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Layout regression tests for the project-folder header's icon/chevron.
 // Desired behaviour: a project folder shows its folder icon by default and,
 // on desktop hover/focus, swaps that folder icon for a chevron *in place*
@@ -17,10 +17,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 //   3. A header without a leading icon (the "Projects" group header) keeps a
 //      hover-revealed trailing chevron and does NOT swap an icon.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
@@ -33,7 +30,6 @@ vi.mock("@/hooks/useConversations", async () => {
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -43,18 +39,7 @@ function mockConversations(conversations: Conversation[]) {
 }
 
 function renderSidebar(initialEntry = "/") {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            <Sidebar open={true} onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  return renderSidebarAt({ route: initialEntry });
 }
 
 /** The <button> header for a section/folder, found by its accessible name. */

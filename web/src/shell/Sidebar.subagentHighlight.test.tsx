@@ -30,10 +30,7 @@ import type { Session } from "@/lib/types";
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
-  return {
-    ...conversationHooksMock(),
-    useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
-  };
+  return conversationHooksMock();
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 

@@ -16,7 +16,7 @@ import type { Conversation } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("./sidebarMockHelpers");
-  return { ...conversationHooksMock() };
+  return conversationHooksMock();
 });
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
