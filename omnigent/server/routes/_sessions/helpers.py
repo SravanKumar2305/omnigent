@@ -7073,33 +7073,34 @@ def _web_send_stable_id(body: SessionEventInput) -> str | None:
     return None
 
 
-def _reject_conflicting_stable_id_reuse(
+def _stable_id_reuse_is_exact_retry(
     persisted: ConversationItem, item: NewConversationItem
-) -> None:
+) -> bool:
     """
-    Refuse a send whose stable id already names a different item.
+    Tell whether a send deduplicated by its stable id is a retry of that item.
 
     The store answers a repeated ``stable_id`` with the persisted item instead of
     inserting, which is right for the retry of a send whose acknowledgement was
-    lost. Any other body under that id (edited text, other attachments, another
-    author) would then run on the runner while history kept the old item, so it
-    is rejected before anything is forwarded.
+    lost. A different body from the same author is not an error: web bundles
+    from before the server adopted client ids resend an edited restored draft
+    under the original id, and must keep working while such tabs stay open. The
+    caller persists that body under a store-assigned id. Another author reusing
+    a visible id is refused so a prompt can never run under someone else's item.
 
     :param persisted: The item the store returned, flagged ``deduplicated``.
     :param item: The item built from the request being persisted.
-    :raises OmnigentError: ``CONFLICT`` when type, author or payload differ.
+    :returns: ``True`` for a byte-identical retry, ``False`` for another body
+        from the same author.
+    :raises OmnigentError: ``CONFLICT`` when the author differs.
     """
-    if (
-        persisted.type == item.type
-        and persisted.created_by == item.created_by
-        and persisted.data.model_dump(mode="json", by_alias=True)
-        == item.data.model_dump(mode="json", by_alias=True)
-    ):
-        return
-    raise OmnigentError(
-        f"stable_id {item.stable_id!r} already names a different item in this session",
-        code=ErrorCode.CONFLICT,
-    )
+    if persisted.created_by != item.created_by:
+        raise OmnigentError(
+            f"stable_id {item.stable_id!r} already names another author's item in this session",
+            code=ErrorCode.CONFLICT,
+        )
+    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
+    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    return persisted.type == item.type and persisted_payload == request_payload
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:

@@ -14,6 +14,10 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.entities import NewConversationItem
+from omnigent.entities.conversation import ConversationItem
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.routes._sessions.helpers import _stable_id_reuse_is_exact_retry
 from omnigent.server.routes.sessions import _build_new_item
 from omnigent.server.schemas import SessionEventInput
 from tests.server.helpers import create_test_agent
@@ -60,6 +64,57 @@ def test_build_new_item_ignores_unusable_stable_id(data: dict[str, Any]) -> None
     )
 
     assert item.stable_id is None
+
+
+def _persisted(text: str = _TEXT, created_by: str | None = "user_a") -> ConversationItem:
+    """The item the store hands back when a send's stable id is already persisted."""
+    message = _user_message()
+    message["content"] = [{"type": "input_text", "text": text}]
+    built = _build_new_item(
+        SessionEventInput(type="message", data=message),
+        "resp_0",
+        created_by=created_by,
+        adopt_stable_id=True,
+    )
+    return ConversationItem(
+        id=_STABLE_ID,
+        type=built.type,
+        status="completed",
+        response_id=built.response_id,
+        created_at=1000,
+        data=built.data,
+        created_by=created_by,
+        deduplicated=True,
+    )
+
+
+def _resend(text: str = _TEXT, created_by: str | None = "user_a") -> NewConversationItem:
+    """The item built from a send that reuses the persisted stable id."""
+    message = _user_message()
+    message["content"] = [{"type": "input_text", "text": text}]
+    return _build_new_item(
+        SessionEventInput(type="message", data=message),
+        "resp_1",
+        created_by=created_by,
+        adopt_stable_id=True,
+    )
+
+
+def test_stable_id_reuse_by_the_same_author_is_a_retry_only_when_the_body_matches() -> None:
+    """An identical resend is the lost-ack retry; an edited one is a new message."""
+    assert _stable_id_reuse_is_exact_retry(_persisted(), _resend()) is True
+    assert _stable_id_reuse_is_exact_retry(_persisted(), _resend(f"{_TEXT}, but edited")) is False
+    # Single-user mode: both sides carry no identity and still compare equal.
+    assert _stable_id_reuse_is_exact_retry(_persisted(created_by=None), _resend(created_by=None))
+
+
+def test_stable_id_reuse_by_another_author_is_refused() -> None:
+    """A visible item id must never let someone else's prompt run under that item."""
+    with pytest.raises(OmnigentError) as excinfo:
+        _stable_id_reuse_is_exact_retry(
+            _persisted(created_by="user_a"), _resend(created_by="user_b")
+        )
+    assert excinfo.value.code == ErrorCode.CONFLICT
 
 
 def _stub_runner(
@@ -116,13 +171,20 @@ async def test_web_send_persists_under_its_stable_id_and_dedupes_a_retry(
 
 
 @pytest.mark.asyncio
-async def test_web_send_rejects_a_different_body_under_a_persisted_stable_id(
+async def test_web_send_of_an_edited_body_under_a_persisted_stable_id_gets_a_fresh_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stable id names one message: other content under it is refused, not run."""
+    """A pre-adoption web bundle's edited retry keeps working: new item, new id, still run.
+
+    Older bundles retain a failed send's stable id even after the user edits the
+    restored text. The edited body must neither be refused (the old client would
+    restore and resend it under the same id forever) nor run under the ORIGINAL
+    item: it is persisted under a store-assigned id, as before adoption.
+    """
     forwarded: list[dict[str, Any]] = []
     fake_runner = _stub_runner(monkeypatch, forwarded)
+    edited_text = f"{_TEXT}, but edited"
     try:
         agent = await create_test_agent(client)
         create = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
@@ -132,21 +194,24 @@ async def test_web_send_rejects_a_different_body_under_a_persisted_stable_id(
 
         first = await client.post(events, json={"type": "message", "data": _user_message()})
         assert first.status_code == 202, first.text
-        # An edited draft (or any client) reusing the persisted id: the store
-        # would dedupe it to the ORIGINAL item, so the new text must not run.
         edited = _user_message()
-        edited["content"] = [{"type": "input_text", "text": f"{_TEXT}, but edited"}]
-        conflict = await client.post(events, json={"type": "message", "data": edited})
-        assert conflict.status_code == 409, conflict.text
+        edited["content"] = [{"type": "input_text", "text": edited_text}]
+        resend = await client.post(events, json={"type": "message", "data": edited})
+        assert resend.status_code == 202, resend.text
     finally:
         await fake_runner.aclose()
 
-    turns = [turn for turn in forwarded if turn.get("type") == "message"]
-    assert [turn["content"][0]["text"] for turn in turns] == [_TEXT]
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     messages = [it for it in items if it["type"] == "message"]
-    assert [it["id"] for it in messages] == [_STABLE_ID]
-    assert messages[0]["content"][0]["text"] == _TEXT
+    assert [m["content"][0]["text"] for m in messages] == [_TEXT, edited_text]
+    assert messages[0]["id"] == _STABLE_ID
+    assert messages[1]["id"] != _STABLE_ID
+    # Each body ran under the item that actually holds it.
+    turns = [turn for turn in forwarded if turn.get("type") == "message"]
+    assert [(turn["content"][0]["text"], turn["persisted_item_id"]) for turn in turns] == [
+        (_TEXT, _STABLE_ID),
+        (edited_text, messages[1]["id"]),
+    ]
 
 
 @pytest.mark.asyncio

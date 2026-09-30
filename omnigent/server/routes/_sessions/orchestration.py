@@ -303,7 +303,6 @@ from omnigent.server.routes._sessions.helpers import (
     _query_host_runner_status,
     _read_state_entry,
     _record_daily_cost,
-    _reject_conflicting_stable_id_reuse,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _relay_persist,
@@ -324,6 +323,7 @@ from omnigent.server.routes._sessions.helpers import (
     _SessionEventDispatchResult,
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
+    _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
     _usage_by_model_for_display,
     _validate_session_workspace,
@@ -5877,21 +5877,29 @@ async def _forward_event_to_runner(
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
-    # A web send keeps its client stable id so the persisted item is
-    # idempotent on retry and recognizable to the client (see
-    # _web_send_stable_id); seeded items keep store-assigned ids.
+    # A web send is persisted under its client stable id (see _web_send_stable_id).
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
         [item],
     )
-    if item.stable_id is not None and persisted_items[0].deduplicated:
-        # The client id already named an item, so the store handed that item
-        # back instead of inserting. A retry of the same send still goes to the
-        # runner (its first forward may have died); anything else must not run
-        # under an item that does not hold it.
-        _reject_conflicting_stable_id_reuse(persisted_items[0], item)
+    if (
+        item.stable_id is not None
+        and persisted_items[0].deduplicated
+        and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
+    ):
+        # A persisted retry may still need forwarding if the first attempt
+        # failed before reaching the runner. A different body under the id
+        # (a pre-adoption web bundle resending an edited restored draft) is a
+        # new message: give it a store-assigned id so it runs under the item
+        # that holds it.
+        item = _build_new_item(body, turn_id, created_by=created_by)
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
     await _seed_missing_title_from_user_message(
         conv,
         item,
