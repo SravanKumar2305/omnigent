@@ -2430,7 +2430,7 @@ def _crop_recorded_clip(png: bytes, page: Any, kwargs: dict[str, Any]) -> bytes:
     right = min(image.width, left + math.floor(math.floor(width + 1e-3) * factor + 0.5))
     bottom = min(image.height, top + math.floor(math.floor(height + 1e-3) * factor + 0.5))
     if right <= left or bottom <= top:
-        raise ValueError("Clipped area is either empty or outside the resulting image")
+        raise Error("Clipped area is either empty or outside the resulting image")
     cropped = image.crop((left, top, right, bottom))
 
     path = kwargs.get("path")

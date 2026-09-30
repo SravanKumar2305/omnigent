@@ -29,7 +29,8 @@ def ffmpeg() -> str:
 
 
 def fraction_near(frame: Path, color: tuple[int, int, int], tolerance: int = 8) -> float:
-    data = Image.open(frame).convert("RGB").reduce(8).tobytes()
+    with Image.open(frame) as image:
+        data = image.convert("RGB").reduce(8).tobytes()
     pixels = [data[i : i + 3] for i in range(0, len(data), 3)]
     near = sum(
         1

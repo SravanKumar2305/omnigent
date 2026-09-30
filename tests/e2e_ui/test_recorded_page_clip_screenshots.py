@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageChops
 from playwright.async_api import async_playwright
-from playwright.sync_api import Browser
+from playwright.sync_api import Browser, Error
 
 from tests.helpers.ui_recording import extract_frames, fraction_near
 
@@ -147,15 +147,17 @@ def test_recorded_clip_scale_and_viewport(
     _assert_same_pixels(*shots, scale=2 if scale == "device" and not no_viewport else 1)
 
 
-@pytest.mark.parametrize("quality", [0, 80, 100])
+@pytest.mark.parametrize("quality", [None, 0, 80, 100])
 def test_recorded_jpeg_clip_preserves_quality_and_path(
-    browser: Browser, tmp_path: Path, quality: int
+    browser: Browser, tmp_path: Path, quality: int | None
 ) -> None:
+    _skip_unless_chromium(browser)
     context = browser.new_context(record_video_dir=str(tmp_path / "video"))
     page = context.new_page()
     page.set_content(_PAGE)
     path = tmp_path / "out" / "clip.jpg"
-    data = page.screenshot(clip=_CLIP, path=path, quality=quality)
+    options = {} if quality is None else {"quality": quality}
+    data = page.screenshot(clip=_CLIP, path=path, **options)
     context.close()
     actual = Image.open(io.BytesIO(data))
     assert actual.format == "JPEG"
@@ -163,10 +165,34 @@ def test_recorded_jpeg_clip_preserves_quality_and_path(
     assert path.read_bytes() == data
     # JPEG quantization tables expose the requested encoder quality, including zero.
     expected = io.BytesIO()
-    Image.new("RGB", actual.size).save(expected, "JPEG", quality=quality)
+    Image.new("RGB", actual.size).save(
+        expected, "JPEG", quality=80 if quality is None else quality
+    )
     with Image.open(expected) as expected_image:
         expected_quantization = expected_image.quantization
     assert actual.quantization == expected_quantization
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+@pytest.mark.parametrize(
+    "clip",
+    [
+        {"x": 2000, "y": 2000, "width": 20, "height": 20},
+        {"x": 0, "y": 0, "width": 0, "height": 20},
+    ],
+)
+def test_invalid_clip_raises_playwright_error(
+    browser: Browser, tmp_path: Path, recorded: bool, clip: dict[str, int]
+) -> None:
+    _skip_unless_chromium(browser)
+    context = browser.new_context(record_video_dir=str(tmp_path / "video") if recorded else None)
+    try:
+        page = context.new_page()
+        page.set_content(_PAGE)
+        with pytest.raises(Error):
+            page.screenshot(clip=clip)
+    finally:
+        context.close()
 
 
 @pytest.mark.parametrize("device_scale_factor", [1, 2])

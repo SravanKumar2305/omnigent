@@ -243,8 +243,10 @@ def test_route_cleanup_fixtures_tolerate_early_close(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     report = _configure(pytester, monkeypatch, tmp_path, record_dir=tmp_path / "raw")
-    pytester.makeconftest("""
-pytest_plugins = ["tests.e2e_ui.conftest"]
+    conftest = pytester.path / "conftest.py"
+    conftest.write_text(
+        conftest.read_text()
+        + """
 from tests.e2e_ui.chat.test_claude_model_picker import _finish_snapshot_routes
 from tests.e2e_ui.chat.test_side_chat_entrypoints import side_chat_forks
 from tests.e2e_ui.files.test_files_panel_header import _drop_routes as files_routes
@@ -253,16 +255,15 @@ from tests.e2e_ui.sessions.test_host_badge import _drop_routes as badge_routes
 from tests.e2e_ui.sessions.test_host_switch_reattaches_terminal import _drop_routes as switch
 from tests.e2e_ui.sessions.test_reconnect_local_host_from_app import _drop_routes as reconnect
 
-import pytest
-
 @pytest.fixture
 def seeded_session():
     return ("http://127.0.0.1", "recording-test")
-""")
+"""
+    )
     pytester.makepyfile(
         _PAGE_DEPENDENT_CLEANUP_JOURNEY.replace(
             "def test_journey(page, search_sessions):",
-            "def test_journey(page, search_sessions, side_chat_forks):",
+            "def test_journey(page, search_sessions, side_chat_forks, files_routes):",
         )
     )
     result = pytester.runpytest_subprocess("-q", *_PLAYWRIGHT_PLUGINS)
